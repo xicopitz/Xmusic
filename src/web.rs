@@ -1,0 +1,659 @@
+//! HTTP server: embedded dashboard + JSON API. Routing is a plain match on (method, path segments).
+// ponytail: no TLS here; put it behind a reverse proxy for anything beyond the LAN.
+
+use crate::auth::{self, User};
+use crate::db::{self, Settings};
+use crate::{apply, job, matcher};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
+use std::io::{Cursor, Read};
+use std::sync::Arc;
+use tiny_http::{Header, Method, Request, Response, Server};
+
+type Resp = Response<Cursor<Vec<u8>>>;
+
+const ASSETS: &[(&str, &str, &[u8])] = &[
+    ("daisyui.css", "text/css", include_bytes!("../assets/daisyui.css")),
+    ("tailwind-browser.js", "text/javascript", include_bytes!("../assets/tailwind-browser.js")),
+    ("chart.umd.min.js", "text/javascript", include_bytes!("../assets/chart.umd.min.js")),
+];
+
+pub fn serve() {
+    let port = std::env::var("XMUSIC_PORT").unwrap_or_else(|_| "8337".into());
+    let server = Arc::new(Server::http(format!("0.0.0.0:{port}")).expect("bind"));
+    println!("xmusic listening on :{port}");
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let server = server.clone();
+            std::thread::spawn(move || {
+                while let Ok(mut req) = server.recv() {
+                    let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(&mut req)))
+                        .unwrap_or_else(|_| err(500, "internal error"));
+                    let _ = req.respond(resp);
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        let _ = w.join();
+    }
+}
+
+fn header(k: &str, v: &str) -> Header {
+    Header::from_bytes(k, v).unwrap()
+}
+
+fn json_resp(code: u16, v: Value) -> Resp {
+    Response::from_data(v.to_string()).with_status_code(code).with_header(header("Content-Type", "application/json"))
+}
+
+fn ok(v: Value) -> Resp {
+    json_resp(200, v)
+}
+
+fn err(code: u16, msg: &str) -> Resp {
+    json_resp(code, json!({ "error": msg }))
+}
+
+fn with_session(r: Resp, token: &str) -> Resp {
+    r.with_header(header("Set-Cookie", &format!("{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000", auth::COOKIE)))
+}
+
+fn cookie(req: &Request) -> Option<String> {
+    req.headers()
+        .iter()
+        .filter(|h| h.field.equiv("Cookie"))
+        .flat_map(|h| h.value.as_str().split(';'))
+        .find_map(|kv| kv.trim().strip_prefix(&format!("{}=", auth::COOKIE)).map(String::from))
+}
+
+/// Any query result as a JSON array of objects keyed by column name.
+pub fn rows(c: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<Value> {
+    let mut st = c.prepare(sql).unwrap();
+    let names: Vec<String> = st.column_names().map(String::from).collect();
+    st.query_map(p, |r| {
+        let mut o = serde_json::Map::new();
+        for (i, n) in names.iter().enumerate() {
+            let v = match r.get_ref(i)? {
+                ValueRef::Null => Value::Null,
+                ValueRef::Integer(x) => json!(x),
+                ValueRef::Real(x) => json!(x),
+                ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+                ValueRef::Blob(_) => Value::Null,
+            };
+            o.insert(n.clone(), v);
+        }
+        Ok(Value::Object(o))
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+fn handle(req: &mut Request) -> Resp {
+    let method = req.method().clone();
+    let url = req.url().to_string();
+    let path = url.split('?').next().unwrap_or_default().to_string();
+    let query = url.split_once('?').map(|x| x.1.to_string()).unwrap_or_default();
+    let seg: Vec<&str> = path.trim_matches('/').split('/').collect();
+
+    // public on purpose: Prometheus can't log in. Counts and library names only (see metrics.rs)
+    if method == Method::Get && path == "/metrics" {
+        return Response::from_data(crate::metrics::render(&db::open())).with_header(header("Content-Type", "text/plain; version=0.0.4"));
+    }
+    if method == Method::Get && !path.starts_with("/api/") {
+        if let ["assets", name] = seg.as_slice() {
+            return match ASSETS.iter().find(|a| a.0 == *name) {
+                Some((_, ct, data)) => Response::from_data(data.to_vec())
+                    .with_header(header("Content-Type", ct))
+                    .with_header(header("Cache-Control", "public, max-age=604800")),
+                None => err(404, "not found"),
+            };
+        }
+        return Response::from_data(include_str!("dashboard.html")).with_header(header("Content-Type", "text/html; charset=utf-8"));
+    }
+
+    // JSON-only writes: a cross-site form can't send application/json without a CORS preflight
+    let body: Value = if method == Method::Get {
+        Value::Null
+    } else {
+        let is_json = req.headers().iter().any(|h| h.field.equiv("Content-Type") && h.value.as_str().starts_with("application/json"));
+        if !is_json {
+            return err(415, "application/json required");
+        }
+        let mut buf = String::new();
+        if req.as_reader().take(1 << 20).read_to_string(&mut buf).is_err() {
+            return err(400, "bad body");
+        }
+        if buf.trim().is_empty() { json!({}) } else {
+            match serde_json::from_str(&buf) {
+                Ok(v) => v,
+                Err(_) => return err(400, "invalid json"),
+            }
+        }
+    };
+    let s = |k: &str| body[k].as_str().unwrap_or_default().to_string();
+    let c = db::open();
+    let ip = req.remote_addr().map(|a| a.ip()).unwrap_or([0, 0, 0, 0].into());
+
+    // public routes
+    match (&method, seg.as_slice()) {
+        (Method::Get, ["api", "setup"]) => return ok(json!({ "needs_setup": auth::user_count(&c) == 0 })),
+        (Method::Post, ["api", "setup"]) => {
+            if auth::user_count(&c) > 0 {
+                return err(403, "already set up");
+            }
+            return match auth::create_user(&c, &s("name"), &s("password"), "admin") {
+                Ok(id) => with_session(ok(json!({"ok": true})), &auth::new_session(&c, id)),
+                Err(e) => err(400, &e),
+            };
+        }
+        (Method::Post, ["api", "login"]) => {
+            if auth::throttled(ip) {
+                return err(429, "too many attempts, wait a minute");
+            }
+            let tok = auth::login(&c, &s("name"), &s("password"));
+            auth::record(ip, tok.is_some());
+            return match tok {
+                Some(t) => with_session(ok(json!({"ok": true})), &t),
+                None => err(401, "wrong user or password"),
+            };
+        }
+        _ => {}
+    }
+
+    let token = cookie(req).unwrap_or_default();
+    let Some(user) = auth::session_user(&c, &token) else { return err(401, "login required") };
+    api(&c, &method, &seg, &query, &body, &user, &token)
+}
+
+fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value, user: &User, token: &str) -> Resp {
+    let s = |k: &str| body[k].as_str().unwrap_or_default().to_string();
+    let admin_only = !user.admin;
+    match (method, seg) {
+        (Method::Post, ["api", "logout"]) => {
+            auth::logout(c, token);
+            ok(json!({"ok": true})).with_header(header("Set-Cookie", &format!("{}=; Path=/; Max-Age=0", auth::COOKIE)))
+        }
+        (Method::Get, ["api", "me"]) => ok(json!({ "name": user.name, "admin": user.admin })),
+        (Method::Get, ["api", "stats"]) => ok(stats(c)),
+        (Method::Get, ["api", "history"]) => ok(json!({
+            "snapshots": rows(c, "SELECT * FROM (SELECT * FROM stats_snapshots ORDER BY ts DESC LIMIT 60) ORDER BY ts", []),
+            "jobs": rows(c, "SELECT * FROM jobs ORDER BY id DESC LIMIT 30", []),
+        })),
+        (Method::Get, ["api", "job"]) => ok(serde_json::to_value(job::status()).unwrap()),
+        (Method::Post, ["api", "job", "cancel"]) => if job::cancel() { ok(json!({"ok": true})) } else { err(409, "no job is running") },
+        (Method::Post, ["api", "run"]) => {
+            let kind = match s("kind").as_str() {
+                "full" => job::Kind::Full,
+                "apply" => job::Kind::Apply,
+                "scan" => job::Kind::Scan,
+                "covers" => job::Kind::Covers,
+                "lyrics" => job::Kind::Lyrics,
+                "rules" if user.admin => job::Kind::Rules,
+                _ => return err(400, "unknown or forbidden job kind"),
+            };
+            if job::start(kind) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
+        }
+        (Method::Post, ["api", "undo"]) => {
+            let dir = body["dir"].as_str().map(String::from);
+            if dir.is_none() && admin_only {
+                return err(403, "admin only");
+            }
+            if job::start(job::Kind::Undo(dir)) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
+        }
+        (Method::Get, ["api", "issues"]) => ok(issues(c)),
+        (Method::Post, ["api", "rematch"]) => {
+            let dir = s("dir");
+            if c.query_row("SELECT 1 FROM tracks WHERE dir=?1 LIMIT 1", [&dir], |_| Ok(())).is_err() {
+                return err(404, "album folder not found in the library");
+            }
+            if job::start(job::Kind::Rematch(vec![dir])) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
+        }
+        (Method::Post, ["api", "library"]) => ok(library(c, body)),
+        (Method::Post, ["api", "library", "album"]) => ok(album(c, &s("dir"))),
+        (Method::Get, ["api", "duplicates"]) => ok(duplicates(c)),
+        (Method::Get, ["api", "cover", id]) => cover(c, id),
+        (Method::Get, ["api", "proposals"]) => {
+            let status = query.split('&').find_map(|kv| kv.strip_prefix("status=")).unwrap_or("review");
+            ok(json!(rows(
+                c,
+                "SELECT id,dir,status,confidence,release_id,release_title,note,updated,
+                        (SELECT COUNT(*) FROM tracks t WHERE t.dir=p.dir) AS tracks
+                 FROM proposals p WHERE status=?1 ORDER BY confidence DESC LIMIT 500",
+                [status]
+            )))
+        }
+        (Method::Post, ["api", "proposals", "bulk"]) => bulk(c, body),
+        (Method::Get, ["api", "proposals", id]) => proposal_detail(c, id),
+        (Method::Post, ["api", "proposals", id, action]) => proposal_action(c, id, action, body),
+
+        // admin
+        _ if admin_only => err(403, "admin only"),
+        (Method::Get, ["api", "settings"]) => ok(serde_json::to_value(Settings::load(c)).unwrap()),
+        (Method::Put, ["api", "settings"]) => {
+            let new: Settings = match serde_json::from_value(body.clone()) {
+                Ok(v) => v,
+                Err(e) => return err(400, &e.to_string()),
+            };
+            if !new.schedule.trim().is_empty()
+                && let Err(e) = job::parse_cron(&new.schedule) {
+                    return err(400, &format!("schedule: {e}"));
+                }
+            if let Some(r) = new.rewrites.iter().find(|r| regex::Regex::new(&r.pattern).is_err()) {
+                return err(400, &format!("invalid regex: {}", r.pattern));
+            }
+            new.save(c);
+            job::reschedule();
+            crate::watch::reload();
+            ok(json!({"ok": true}))
+        }
+        (Method::Post, ["api", "notify", "test"]) => {
+            let st = Settings::load(c);
+            let link = (!st.public_url.trim().is_empty()).then(|| format!("{}/#review", st.public_url.trim().trim_end_matches('/')));
+            match crate::remote::gotify(&st.contact_email, &st.gotify_url, &st.gotify_token, st.gotify_priority, "xmusic test", "Notifications work.", link.as_deref()) {
+                Ok(()) => ok(json!({"ok": true})),
+                Err(e) => err(502, &e),
+            }
+        }
+        (Method::Post, ["api", "navidrome", "test"]) => {
+            let st = Settings::load(c);
+            match crate::remote::navidrome_scan(&st.contact_email, &st.navidrome_url, &st.navidrome_user, &st.navidrome_password) {
+                Ok(()) => ok(json!({"ok": true})),
+                Err(e) => err(502, &e),
+            }
+        }
+        (Method::Post, ["api", "browse"]) => browse(&s("path")),
+        (Method::Post, ["api", "duplicates", "keep"]) => keep_copy(c, &s("dir")),
+        (Method::Post, ["api", "trash", id, "restore"]) => match apply::restore(c, id.parse().unwrap_or(0)) {
+            Ok(()) => {
+                job::start(job::Kind::Scan);
+                job::navidrome(&Settings::load(c));
+                ok(json!({"ok": true}))
+            }
+            Err(e) => err(409, &e),
+        },
+        (Method::Get, ["api", "libraries"]) => ok(json!(rows(
+            c,
+            "SELECT l.*, (SELECT COUNT(*) FROM tracks t WHERE t.library_id=l.id) AS tracks FROM libraries l ORDER BY name",
+            []
+        ))),
+        (Method::Post, ["api", "libraries"]) => {
+            let path = s("path").trim_end_matches('/').to_string();
+            let p = std::path::Path::new(&path);
+            if !p.is_absolute() || !p.is_dir() {
+                return err(400, "path must be an existing absolute directory inside the container");
+            }
+            if std::fs::read_dir(p).is_err() || std::fs::metadata(p).is_ok_and(|m| m.permissions().readonly()) {
+                return err(400, "path must be readable and writable");
+            }
+            let name = Some(s("name")).filter(|n| !n.trim().is_empty()).unwrap_or(path.clone());
+            match c.execute("INSERT INTO libraries(name,path) VALUES(?1,?2)", params![name, path]) {
+                Ok(_) => {
+                    crate::watch::reload();
+                    ok(json!({"ok": true}))
+                }
+                Err(_) => err(400, "library already exists"),
+            }
+        }
+        (Method::Post, ["api", "libraries", id, "toggle"]) => {
+            c.execute("UPDATE libraries SET enabled=1-enabled WHERE id=?1", [id]).unwrap();
+            crate::watch::reload();
+            ok(json!({"ok": true}))
+        }
+        (Method::Delete, ["api", "libraries", id]) => {
+            c.execute("DELETE FROM proposals WHERE dir IN (SELECT dir FROM tracks WHERE library_id=?1)", [id]).unwrap();
+            c.execute("DELETE FROM libraries WHERE id=?1", [id]).unwrap();
+            crate::watch::reload();
+            ok(json!({"ok": true}))
+        }
+        (Method::Get, ["api", "users"]) => ok(json!(rows(c, "SELECT id,name,role FROM users ORDER BY name", []))),
+        (Method::Post, ["api", "users"]) => {
+            let role = if s("role") == "admin" { "admin" } else { "user" };
+            match auth::create_user(c, &s("name"), &s("password"), role) {
+                Ok(_) => ok(json!({"ok": true})),
+                Err(e) => err(400, &e),
+            }
+        }
+        (Method::Post, ["api", "users", id, "password"]) => {
+            let name: String = match c.query_row("SELECT name FROM users WHERE id=?1", [id], |r| r.get(0)) {
+                Ok(n) => n,
+                Err(_) => return err(404, "no such user"),
+            };
+            match auth::set_password(c, &name, &s("password")) {
+                Ok(()) => ok(json!({"ok": true})),
+                Err(e) => err(400, &e),
+            }
+        }
+        (Method::Delete, ["api", "users", id]) => {
+            if id.parse::<i64>().ok() == Some(user.id) {
+                return err(400, "you can't delete yourself");
+            }
+            c.execute("DELETE FROM users WHERE id=?1", [id]).unwrap();
+            ok(json!({"ok": true}))
+        }
+        _ => err(404, "not found"),
+    }
+}
+
+/// Folder picker for adding libraries. Never lists anything outside the music root.
+fn browse(path: &str) -> Resp {
+    let root = std::env::var("XMUSIC_MUSIC").unwrap_or_else(|_| "/music".into());
+    let root = std::fs::canonicalize(&root).or_else(|_| std::fs::canonicalize("/")).unwrap();
+    let want = if path.is_empty() { root.clone() } else { std::path::PathBuf::from(path) };
+    // canonicalize resolves `..` and symlinks, so the prefix check can't be walked around
+    let dir = match std::fs::canonicalize(&want) {
+        Ok(d) if d.starts_with(&root) && d.is_dir() => d,
+        _ => return err(400, "not a folder inside the music root"),
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return err(400, "folder is not readable") };
+    let (mut dirs, mut audio) = (vec![], 0);
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if !e.file_name().to_string_lossy().starts_with('.') {
+                dirs.push(e.file_name().to_string_lossy().into_owned());
+            }
+        } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| crate::tags::AUDIO_EXT.contains(&x.to_ascii_lowercase().as_str())) {
+            audio += 1;
+        }
+    }
+    dirs.sort_by_key(|d| d.to_lowercase());
+    let parent = (dir != root).then(|| dir.parent().map(|p| p.to_string_lossy().into_owned())).flatten();
+    ok(json!({ "path": dir.to_string_lossy(), "root": root.to_string_lossy(), "parent": parent, "dirs": dirs, "audio_files": audio }))
+}
+
+fn stats(c: &Connection) -> Value {
+    json!({
+        "totals": rows(c, &format!("SELECT COUNT(*) AS tracks, COUNT(DISTINCT dir) AS albums, COALESCE(SUM(size),0) AS bytes, COALESCE(SUM(duration),0) AS seconds,
+            SUM(json_extract(tags,'$.MUSICBRAINZ_ALBUMID') IS NOT NULL) AS with_mbid, SUM({}) AS with_cover, SUM(has_lyrics) AS with_lyrics FROM tracks", db::HAS_COVER), [])[0],
+        "formats": rows(c, "SELECT format, COUNT(*) AS tracks, SUM(size) AS bytes, SUM(duration) AS seconds, CAST(AVG(bitrate) AS INT) AS avg_bitrate
+            FROM tracks GROUP BY format ORDER BY tracks DESC", []),
+        "quality": rows(c, "SELECT format, CASE WHEN bit_depth>0 THEN printf('%d-bit / %g kHz', bit_depth, sample_rate/1000.0)
+                ELSE printf('~%d kbps', ((bitrate+16)/32)*32) END AS quality, COUNT(*) AS tracks
+            FROM tracks GROUP BY 1,2 ORDER BY tracks DESC", []),
+        "libraries": rows(c, "SELECT l.id, l.name, l.path, l.enabled, l.last_scan, t.format, COUNT(t.id) AS tracks, COALESCE(SUM(t.size),0) AS bytes
+            FROM libraries l LEFT JOIN tracks t ON t.library_id=l.id GROUP BY l.id, t.format ORDER BY l.name, tracks DESC", []),
+        "decades": rows(c, "SELECT (CAST(substr(json_extract(tags,'$.DATE'),1,4) AS INT)/10)*10 AS decade, COUNT(DISTINCT dir) AS albums
+            FROM tracks WHERE json_extract(tags,'$.DATE') GLOB '[12][0-9][0-9][0-9]*' GROUP BY 1 ORDER BY 1", []),
+        "queue": rows(c, "SELECT status, COUNT(*) AS n FROM proposals GROUP BY status", []),
+    })
+}
+
+fn issues(c: &Connection) -> Value {
+    let small = Settings::load(c).cover_upgrade_below;
+    let missing = |k: &str| format!("SUM(json_extract(tags,'$.{k}') IS NULL) AS no_{}", k.to_lowercase());
+    let has_cover = db::HAS_COVER;
+    json!({
+        "counts": rows(c, &format!("SELECT {}, {}, {}, {}, SUM(NOT {has_cover}) AS no_cover, SUM(has_lyrics=0) AS no_lyrics,
+            SUM(has_cover=1 AND cover_px>0 AND cover_px<{small}) AS small_cover FROM tracks",
+            missing("TITLE"), missing("ARTIST"), missing("ALBUM"), missing("MUSICBRAINZ_ALBUMID")), [])[0],
+        "albums": rows(c, &format!("SELECT dir, COUNT(*) AS tracks,
+                SUM(json_extract(tags,'$.MUSICBRAINZ_ALBUMID') IS NULL) AS no_mbid, SUM(NOT {has_cover}) AS no_cover, SUM(has_lyrics=0) AS no_lyrics,
+                COUNT(DISTINCT json_extract(tags,'$.ALBUMARTIST')) > 1 OR COUNT(DISTINCT json_extract(tags,'$.DATE')) > 1 AS inconsistent,
+                MAX(CAST(json_extract(tags,'$.TRACKNUMBER') AS INT)) > COUNT(*) AS gaps
+            FROM tracks GROUP BY dir HAVING no_mbid>0 OR no_cover>0 OR inconsistent OR gaps ORDER BY dir LIMIT 500"), []),
+    })
+}
+
+const ARTIST: &str = "COALESCE(json_extract(tags,'$.ALBUMARTIST'), json_extract(tags,'$.ARTIST'))";
+
+/// Albums (one per folder) or artists, optionally filtered by a search string or one artist. 60 per page.
+fn library(c: &Connection, body: &Value) -> Value {
+    let q = format!("%{}%", body["q"].as_str().unwrap_or_default().trim().to_lowercase());
+    let artist = body["artist"].as_str().unwrap_or_default();
+    let offset = body["offset"].as_i64().unwrap_or(0).max(0);
+    // a folder matches when any of its tracks matches, then the whole album is listed
+    let matching = format!(
+        "SELECT dir FROM tracks WHERE (?1='%%' OR lower(json_extract(tags,'$.ALBUM')) LIKE ?1 OR lower(json_extract(tags,'$.ARTIST')) LIKE ?1
+           OR lower(json_extract(tags,'$.ALBUMARTIST')) LIKE ?1 OR lower(json_extract(tags,'$.TITLE')) LIKE ?1 OR lower(dir) LIKE ?1)
+         AND (?2='' OR {ARTIST}=?2)"
+    );
+    if body["view"] == "artists" {
+        return json!(rows(
+            c,
+            &format!("SELECT {ARTIST} AS artist, COUNT(DISTINCT dir) AS albums, COUNT(*) AS tracks FROM tracks
+                      WHERE dir IN ({matching}) GROUP BY 1 ORDER BY lower(COALESCE(artist,'')) LIMIT 200 OFFSET ?3"),
+            params![q, artist, offset]
+        ));
+    }
+    json!(rows(
+        c,
+        &format!("SELECT dir, MAX(json_extract(tags,'$.ALBUM')) AS album, MAX({ARTIST}) AS artist,
+                    MAX(substr(json_extract(tags,'$.DATE'),1,4)) AS year, GROUP_CONCAT(DISTINCT format) AS formats,
+                    COUNT(*) AS tracks, SUM(size) AS bytes, SUM(duration) AS seconds,
+                    MIN(json_extract(tags,'$.MUSICBRAINZ_ALBUMID') IS NOT NULL) AS tagged,
+                    COALESCE(MIN(CASE WHEN has_cover=1 THEN id END), MIN(id)) AS cover_id
+                  FROM tracks WHERE dir IN ({matching}) GROUP BY dir
+                  ORDER BY lower(COALESCE(artist,'')), year, lower(COALESCE(album, dir)) LIMIT 61 OFFSET ?3"),
+        params![q, artist, offset]
+    ))
+}
+
+fn album(c: &Connection, dir: &str) -> Value {
+    let tracks = rows(
+        c,
+        "SELECT id, path, format, bitrate, sample_rate, bit_depth, duration, size, has_cover, cover_px, has_lyrics, tags
+         FROM tracks WHERE dir=?1
+         ORDER BY CAST(json_extract(tags,'$.DISCNUMBER') AS INT), CAST(json_extract(tags,'$.TRACKNUMBER') AS INT), path",
+        [dir],
+    );
+    let proposal = rows(c, "SELECT id, status FROM proposals WHERE dir=?1", [dir]).into_iter().next();
+    // a cover.jpg next to the files counts too: `cover()` serves it when no track has embedded art
+    let cover_file: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM cover_files WHERE dir=?1)", [dir], |r| r.get(0)).unwrap();
+    json!({ "dir": dir, "tracks": tracks, "proposal": proposal, "cover_file": cover_file })
+}
+
+/// Embedded front cover of a track, else cover.jpg / folder.jpg next to it.
+fn cover(c: &Connection, id: &str) -> Resp {
+    let Ok(path) = c.query_row("SELECT path FROM tracks WHERE id=?1", [id], |r| r.get::<_, String>(0)) else { return err(404, "no such track") };
+    let path = std::path::Path::new(&path);
+    // ponytail: full-size covers, no thumbnails; the grid lazy-loads and the browser caches them
+    let found = crate::tags::read_cover(path).or_else(|| {
+        crate::scan::COVER_FILES.iter().find_map(|n| {
+            let p = path.parent()?.join(n);
+            let mime = if n.ends_with("png") { "image/png" } else { "image/jpeg" };
+            std::fs::read(p).ok().map(|b| (b, mime.to_string()))
+        })
+    });
+    match found {
+        Some((bytes, mime)) => Response::from_data(bytes).with_header(header("Content-Type", &mime)).with_header(header("Cache-Control", "private, max-age=3600")),
+        None => err(404, "no cover"),
+    }
+}
+
+/// Albums present more than once: same MusicBrainz release, or same artist + album name
+/// (e.g. a FLAC and an MP3 copy), plus folders holding more than one format.
+pub fn duplicates(c: &Connection) -> Value {
+    let dirs = rows(
+        c,
+        &format!("SELECT dir, MAX(json_extract(tags,'$.MUSICBRAINZ_ALBUMID')) AS mbid, MAX({ARTIST}) AS artist,
+                    MAX(json_extract(tags,'$.ALBUM')) AS album, GROUP_CONCAT(DISTINCT format) AS formats,
+                    COUNT(DISTINCT format) AS nformats, COUNT(*) AS tracks, SUM(size) AS bytes, AVG(bitrate) AS bitrate,
+                    MAX(bit_depth) AS bit_depth, COALESCE(MIN(CASE WHEN has_cover=1 THEN id END), MIN(id)) AS cover_id,
+                    GROUP_CONCAT(DISTINCT CAST(COALESCE(json_extract(tags,'$.DISCNUMBER'),1) AS INTEGER)) AS discs
+                  FROM tracks GROUP BY dir"),
+        [],
+    );
+    // union folders that share a release id or a normalized artist + album name, so a tagged
+    // FLAC copy and an untagged MP3 copy of the same album still end up together
+    let norm = |v: &Value| v.as_str().unwrap_or_default().trim().to_lowercase();
+    let mut parent: Vec<usize> = (0..dirs.len()).collect();
+    fn root(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    let mut first: std::collections::HashMap<String, usize> = Default::default();
+    for (i, d) in dirs.iter().enumerate() {
+        // disc set in the key: "Disc 1 X" and "Disc 2 X" folders are halves of one album, not copies
+        let mut discs: Vec<&str> = d["discs"].as_str().unwrap_or_default().split(',').collect();
+        discs.sort();
+        let discs = discs.join(",");
+        let mut keys = vec![];
+        if let Some(id) = d["mbid"].as_str() {
+            keys.push(format!("id:{id}|{discs}"));
+        }
+        if !norm(&d["album"]).is_empty() {
+            keys.push(format!("name:{}|{}|{discs}", norm(&d["artist"]), norm(&d["album"])));
+        }
+        for k in keys {
+            match first.get(&k) {
+                Some(&j) => {
+                    let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                    parent[a] = b;
+                }
+                None => {
+                    first.insert(k, i);
+                }
+            }
+        }
+    }
+    let mut groups: std::collections::BTreeMap<usize, Vec<&Value>> = Default::default();
+    for (i, d) in dirs.iter().enumerate() {
+        groups.entry(root(&mut parent, i)).or_default().push(d);
+    }
+    let mut out: Vec<Value> = groups
+        .into_values()
+        .filter(|g| g.len() > 1)
+        .map(|mut g| {
+            g.sort_by(|a, b| quality(b).total_cmp(&quality(a)));
+            let same_id = g[0]["mbid"].is_string() && g.iter().all(|d| d["mbid"] == g[0]["mbid"]);
+            let reason = if same_id { "same MusicBrainz release" } else { "same artist and album name" };
+            json!({ "reason": reason, "artist": g[0]["artist"], "album": g[0]["album"], "dirs": g })
+        })
+        .collect();
+    out.sort_by_key(|g| norm(&g["artist"]) + &norm(&g["album"]));
+    let mixed: Vec<&Value> = dirs.iter().filter(|d| d["nformats"].as_i64() > Some(1)).collect();
+    json!({ "groups": out, "mixed_folders": mixed, "trash": rows(c, "SELECT * FROM trash ORDER BY ts DESC", []) })
+}
+
+/// Keep `dir`, move the other copies in its duplicate group to the library's trash folder.
+fn keep_copy(c: &Connection, dir: &str) -> Resp {
+    if job::running() {
+        return err(409, "wait for the running job to finish");
+    }
+    let dups = duplicates(c);
+    let Some(group) = dups["groups"].as_array().into_iter().flatten().find(|g| g["dirs"].as_array().is_some_and(|d| d.iter().any(|x| x["dir"] == dir))) else {
+        return err(404, "not part of a duplicate group");
+    };
+    let mut moved = 0;
+    for other in group["dirs"].as_array().unwrap().iter().filter_map(|x| x["dir"].as_str()).filter(|d| *d != dir) {
+        if let Err(e) = apply::trash(c, other) {
+            return err(409, &format!("{e} ({moved} other copies already moved)"));
+        }
+        moved += 1;
+    }
+    job::navidrome(&Settings::load(c));
+    ok(json!({ "ok": true, "moved": moved }))
+}
+
+/// Rank copies: lossless beats lossy, then higher bit depth, then bitrate.
+fn quality(d: &Value) -> f64 {
+    let lossless = d["bit_depth"].as_i64().unwrap_or(0) > 0;
+    (if lossless { 1e6 } else { 0.0 }) + d["bit_depth"].as_f64().unwrap_or(0.0) * 1e4 + d["bitrate"].as_f64().unwrap_or(0.0)
+}
+
+fn proposal_detail(c: &Connection, id: &str) -> Resp {
+    let Some(p) = rows(c, "SELECT * FROM proposals WHERE id=?1", [id]).into_iter().next() else { return err(404, "not found") };
+    let changes: matcher::Changes = serde_json::from_str(p["changes"].as_str().unwrap_or("{}")).unwrap_or_default();
+    let tracks: Vec<Value> = db::tracks_where(c, "dir=?1", [p["dir"].as_str().unwrap_or_default()])
+        .into_iter()
+        .map(|t| {
+            let new = changes.get(&t.id).cloned().unwrap_or_default();
+            let old: serde_json::Map<String, Value> = new.keys().map(|k| (k.clone(), json!(t.tags.get(k)))).collect();
+            json!({ "id": t.id, "file": t.path.rsplit('/').next(), "title": t.tags.get("TITLE"), "duration": t.duration, "old": old, "new": new })
+        })
+        .collect();
+    let mut p = p;
+    p["candidates"] = serde_json::from_str(p["candidates"].as_str().unwrap_or("[]")).unwrap_or_default();
+    p["changes"] = Value::Null;
+    p["tracks"] = json!(tracks);
+    ok(p)
+}
+
+/// Approve, reject or re-match many proposals: {action, ids: [..]}. One job for the lot.
+fn bulk(c: &Connection, body: &Value) -> Resp {
+    let ids: Vec<i64> = body["ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
+    let dirs: Vec<String> = ids.iter().filter_map(|id| c.query_row("SELECT dir FROM proposals WHERE id=?1", [id], |r| r.get(0)).ok()).collect();
+    if dirs.is_empty() {
+        return err(400, "no proposals selected");
+    }
+    let set = |st: &str| {
+        for id in &ids {
+            c.execute("UPDATE proposals SET status=?1, updated=?2 WHERE id=?3", params![st, db::now(), id]).unwrap();
+        }
+    };
+    match body["action"].as_str().unwrap_or_default() {
+        "approve" => {
+            set("approved");
+            ok(json!({ "ok": true, "applying": job::start(job::Kind::Apply) }))
+        }
+        "reject" => {
+            set("rejected");
+            ok(json!({"ok": true}))
+        }
+        "rematch" if job::start(job::Kind::Rematch(dirs)) => ok(json!({"ok": true})),
+        "rematch" => err(409, "a job is already running"),
+        _ => err(400, "unknown action"),
+    }
+}
+
+fn proposal_action(c: &Connection, id: &str, action: &str, body: &Value) -> Resp {
+    let set_status = |st: &str| c.execute("UPDATE proposals SET status=?1, updated=?2 WHERE id=?3", params![st, db::now(), id]).unwrap();
+    match action {
+        "approve" => {
+            set_status("approved");
+            // applies now, or with the next run if a job is busy
+            let started = job::start(job::Kind::Apply);
+            ok(json!({ "ok": true, "applying": started }))
+        }
+        "reject" => {
+            set_status("rejected");
+            ok(json!({"ok": true}))
+        }
+        "edit" => {
+            let (Some(track), Some(key)) = (body["track_id"].as_i64(), body["key"].as_str()) else { return err(400, "track_id and key required") };
+            let raw: String = match c.query_row("SELECT changes FROM proposals WHERE id=?1", [id], |r| r.get(0)) {
+                Ok(v) => v,
+                Err(_) => return err(404, "not found"),
+            };
+            let mut ch: matcher::Changes = serde_json::from_str(&raw).unwrap_or_default();
+            let entry = ch.entry(track).or_default();
+            match body["value"].as_str() {
+                Some(v) => entry.insert(key.trim().to_ascii_uppercase(), v.to_string()),
+                None => entry.remove(key),
+            };
+            c.execute("UPDATE proposals SET changes=?1, updated=?2 WHERE id=?3", params![serde_json::to_string(&ch).unwrap(), db::now(), id]).unwrap();
+            ok(json!({"ok": true}))
+        }
+        "pick" => {
+            let mbid = body["release_id"].as_str().unwrap_or_default().trim();
+            // accept a bare id or a pasted musicbrainz.org/release/<id> URL
+            let mbid = mbid.trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_string();
+            if mbid.len() != 36 {
+                return err(400, "release id must be a MusicBrainz release MBID");
+            }
+            let dir: String = match c.query_row("SELECT dir FROM proposals WHERE id=?1", [id], |r| r.get(0)) {
+                Ok(d) => d,
+                Err(_) => return err(404, "not found"),
+            };
+            let tracks = db::tracks_where(c, "dir=?1", [&dir]);
+            match matcher::for_release(&tracks, &mbid, &Settings::load(c)) {
+                Ok((conf, rel, ch)) => {
+                    c.execute(
+                        "UPDATE proposals SET status='review', confidence=?1, release_id=?2, release_title=?3, changes=?4, updated=?5 WHERE id=?6",
+                        params![conf, rel.id, format!("{} – {}", rel.artist, rel.title), serde_json::to_string(&ch).unwrap(), db::now(), id],
+                    )
+                    .unwrap();
+                    ok(json!({"ok": true}))
+                }
+                Err(e) => err(502, &e),
+            }
+        }
+        _ => err(404, "unknown action"),
+    }
+}

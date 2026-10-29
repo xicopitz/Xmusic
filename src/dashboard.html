@@ -1,0 +1,863 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xmusic</title>
+<link rel="stylesheet" href="/assets/daisyui.css">
+<script src="/assets/tailwind-browser.js"></script>
+<script src="/assets/chart.umd.min.js"></script>
+<script>try { document.documentElement.dataset.theme = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') } catch {}</script>
+</head>
+<body class="min-h-screen bg-base-200">
+
+<!-- login / first-run setup -->
+<div id="auth" class="hidden min-h-screen flex items-center justify-center p-4">
+  <form id="auth-form" class="card bg-base-100 shadow-xl w-full max-w-sm">
+    <div class="card-body gap-3">
+      <h1 class="card-title text-2xl">🎵 xmusic</h1>
+      <p id="auth-hint" class="text-sm opacity-70"></p>
+      <label class="input w-full"><span class="label">User</span><input name="name" required autocomplete="username"></label>
+      <label class="input w-full"><span class="label">Password</span><input name="password" type="password" required minlength="8" autocomplete="current-password"></label>
+      <p id="auth-err" class="text-error text-sm"></p>
+      <button class="btn btn-primary" id="auth-btn">Sign in</button>
+    </div>
+  </form>
+</div>
+
+<div id="app" class="hidden drawer lg:drawer-open">
+  <input id="nav" type="checkbox" class="drawer-toggle">
+  <div class="drawer-content flex flex-col min-w-0">
+    <div class="navbar bg-base-100 shadow-sm sticky top-0 z-10 gap-2">
+      <label for="nav" class="btn btn-ghost btn-square lg:hidden">☰</label>
+      <span id="page-title" class="text-lg font-semibold flex-1"></span>
+      <label class="swap swap-rotate btn btn-ghost btn-circle" title="Theme">
+        <input type="checkbox" id="theme" class="theme-controller">
+        <span class="swap-off">☀️</span><span class="swap-on">🌙</span>
+      </label>
+      <div class="dropdown dropdown-end" id="tasks">
+        <div tabindex="0" role="button" class="btn btn-ghost btn-circle" title="Tasks" aria-label="Tasks">
+          <div class="indicator">
+            <span id="tasks-dot" class="indicator-item status status-info animate-pulse hidden"></span>
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="size-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+          </div>
+        </div>
+        <div tabindex="0" class="dropdown-content card bg-base-100 shadow-lg w-80 z-20 mt-2 max-sm:fixed max-sm:inset-x-4 max-sm:top-14 max-sm:w-auto"><div class="card-body p-4 gap-3" id="tasks-body"></div></div>
+      </div>
+      <div class="dropdown dropdown-end">
+        <div tabindex="0" role="button" class="btn btn-ghost" id="me"></div>
+        <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow w-40 z-20"><li><a id="logout">Sign out</a></li></ul>
+      </div>
+    </div>
+    <div id="banner" class="px-4 pt-4"></div>
+    <div id="runbar" class="px-4 pt-4 empty:hidden"></div>
+    <main class="p-4 w-full max-w-7xl mx-auto">
+      <section data-page="overview"></section>
+      <section data-page="library"></section>
+      <section data-page="review"></section>
+      <section data-page="jobs"></section>
+      <section data-page="settings"></section>
+      <section data-page="users"></section>
+    </main>
+  </div>
+  <div class="drawer-side z-20">
+    <label for="nav" class="drawer-overlay"></label>
+    <ul class="menu bg-base-100 min-h-full w-56 p-4 gap-1">
+      <li class="menu-title text-lg">🎵 xmusic</li>
+      <li><a href="#overview">📊 Overview</a></li>
+      <li><a href="#library">📚 Library</a></li>
+      <li><a href="#review">📝 Review <span id="nav-review" class="badge badge-warning badge-sm hidden"></span></a></li>
+      <li><a href="#jobs">⚙️ Jobs <span id="nav-jobs" class="badge badge-info badge-sm hidden"></span></a></li>
+      <li class="admin"><a href="#settings">🔧 Settings</a></li>
+      <li class="admin"><a href="#users">👥 Users</a></li>
+    </ul>
+  </div>
+</div>
+
+<dialog id="modal" class="modal modal-bottom sm:modal-middle"><div class="modal-box sm:max-w-6xl max-h-[92vh] p-4 sm:p-6" id="modal-body"></div><form method="dialog" class="modal-backdrop"><button>close</button></form></dialog>
+<div id="toasts" class="toast toast-end z-50"></div>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const bytes = b => { b = +b || 0; const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++ } return b.toFixed(i > 2 ? 2 : 0) + ' ' + u[i] };
+const dur = s => { s = Math.round(+s || 0); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s` };
+const when = ts => ts ? new Date(ts * 1000).toLocaleString() : '—';
+const pct = (a, b) => b ? Math.round(100 * a / b) : 0;
+const shortDir = d => esc(String(d).split('/').slice(-2).join(' / '));
+let ME = null;
+
+async function api(method, path, body) {
+  // the server only accepts JSON writes (CSRF guard), so every non-GET sends a JSON body, even DELETE
+  if (method !== 'GET' && body === undefined) body = {};
+  const r = await fetch(path, { method, headers: body !== undefined ? { 'Content-Type': 'application/json' } : {}, body: body !== undefined ? JSON.stringify(body) : undefined });
+  const data = await r.json().catch(() => ({}));
+  if (r.status === 401 && !path.startsWith('/api/login')) { showAuth(); throw new Error('login required') }
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+const post = (p, b = {}) => api('POST', p, b);
+
+function toast(msg, kind = 'success') {
+  const el = document.createElement('div');
+  el.className = `alert alert-${kind}`;
+  el.textContent = msg;
+  $('#toasts').append(el);
+  setTimeout(() => el.remove(), 5000);
+}
+const guard = fn => async (...a) => { try { await fn(...a) } catch (e) { if (e.message !== 'login required') toast(e.message, 'error') } };
+
+/* ---------- auth ---------- */
+async function showAuth() {
+  $('#app').classList.add('hidden'); $('#auth').classList.remove('hidden');
+  const { needs_setup } = await api('GET', '/api/setup');
+  $('#auth-form').dataset.setup = needs_setup ? '1' : '';
+  $('#auth-hint').textContent = needs_setup ? 'First run: create the admin account.' : 'Sign in to continue.';
+  $('#auth-btn').textContent = needs_setup ? 'Create admin account' : 'Sign in';
+}
+$('#auth-form').onsubmit = async e => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try {
+    await post(e.target.dataset.setup ? '/api/setup' : '/api/login', { name: f.get('name'), password: f.get('password') });
+    $('#auth-err').textContent = ''; e.target.reset(); boot();
+  } catch (err) { $('#auth-err').textContent = err.message }
+};
+$('#logout').onclick = guard(async () => { await post('/api/logout'); showAuth() });
+
+/* ---------- theme + charts ---------- */
+const theme = $('#theme');
+theme.checked = document.documentElement.dataset.theme === 'dark';
+theme.value = theme.checked ? 'dark' : 'light';
+theme.onchange = () => {
+  const t = theme.checked ? 'dark' : 'light';
+  document.documentElement.dataset.theme = t; theme.value = t;
+  try { localStorage.setItem('theme', t) } catch {}
+  route();
+};
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+// Categorical palette validated for colorblind separation on both surfaces (dataviz reference instance),
+// stepped separately for light and dark. Status colors are reserved for fixed / review / open.
+const SERIES = {
+  light: ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948'],
+  dark: ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'],
+};
+const STATUS = { good: '#0ca30c', warning: '#fab219', critical: '#d03b3b' };
+const series = i => SERIES[document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light'][i];
+// color follows the format, not its rank, so a format keeps its color as counts change
+// ponytail: formats past the 8th share the last slot; fold them into "Other" if that ever happens
+const FORMAT_SLOT = ['FLAC', 'MP3', 'M4A', 'OGG', 'Opus', 'AAC', 'WAV'];
+const formatColor = f => series(Math.min(FORMAT_SLOT.indexOf(f) < 0 ? 7 : FORMAT_SLOT.indexOf(f), 7));
+// daisyUI tokens are oklch(); Chart.js can't blend those, so resolve through a 1px canvas
+const probe = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+function rgba(color, a = 1) {
+  probe.clearRect(0, 0, 1, 1); probe.fillStyle = color; probe.fillRect(0, 0, 1, 1);
+  const [r, g, b] = probe.getImageData(0, 0, 1, 1).data;
+  return `rgba(${r},${g},${b},${a})`;
+}
+const compact = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 });
+// big number in the middle of a doughnut
+const centerText = {
+  id: 'center',
+  afterDraw(c, _, o) {
+    if (!o.text) return;
+    const { ctx, chartArea: a } = c, x = (a.left + a.right) / 2, y = (a.top + a.bottom) / 2, family = Chart.defaults.font.family;
+    ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = o.ink; ctx.font = `700 22px ${family}`; ctx.fillText(o.text, x, y - 8);
+    ctx.fillStyle = o.muted; ctx.font = `12px ${family}`; ctx.fillText(o.label, x, y + 14);
+    ctx.restore();
+  },
+};
+const charts = {};
+/** opts: stacked, horizontal, fmt (value → text), tick (axis label), titles (tooltip titles), extra (index → extra tooltip line), center ({text,label}) */
+function chart(id, type, labels, datasets, opts = {}) {
+  charts[id]?.destroy();
+  const el = document.getElementById(id);
+  if (!el) return;
+  const ink = rgba(css('--color-base-content')), surface = rgba(css('--color-base-100'));
+  const muted = rgba(css('--color-base-content'), .6), hair = rgba(css('--color-base-content'), .12);
+  const fmt = opts.fmt || (v => v.toLocaleString());
+  Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
+  Chart.defaults.color = muted;
+  const bar = type === 'bar', round = type === 'doughnut';
+  const multi = datasets.length > 1 || round;
+  datasets = datasets.map((d, i) => bar ? {
+    maxBarThickness: 24, borderSkipped: 'start',
+    // stacked: 2px surface gap between segments, rounded except where the bottom segment meets the baseline
+    ...(opts.stacked ? { borderWidth: { top: 2 }, borderColor: surface, borderRadius: i === 0 ? { topLeft: 4, topRight: 4 } : 4, borderSkipped: false } : { borderRadius: 4 }),
+    ...d,
+  } : type === 'line' ? {
+    borderWidth: 2, tension: .3, fill: 'origin', backgroundColor: rgba(d.borderColor, .1),
+    pointRadius: 4, pointHoverRadius: 6, pointBackgroundColor: d.borderColor, pointBorderColor: surface, pointBorderWidth: 2, ...d,
+  } : { borderColor: surface, borderWidth: 2, borderRadius: 4, hoverOffset: 4, ...d });
+  // value axis shows only 0 and the top, with one hairline at the top: the reference's quiet look
+  const valueAxis = {
+    beginAtZero: true, stacked: !!opts.stacked, border: { display: false },
+    grid: { color: ctx => ctx.tick.value === 0 ? 'transparent' : hair, drawTicks: false },
+    ticks: { padding: 8, callback: opts.tick || (v => compact.format(v)) },
+    afterBuildTicks: ax => { ax.ticks = [{ value: ax.min }, { value: ax.max }] },
+  };
+  const catAxis = { stacked: !!opts.stacked, grid: { display: false }, border: { display: true, color: hair }, ticks: { maxRotation: 0, autoSkipPadding: 12 } };
+  charts[id] = new Chart(el, {
+    type, data: { labels, datasets },
+    plugins: [centerText],
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      indexAxis: opts.horizontal ? 'y' : 'x',
+      cutout: '70%',
+      // a tap anywhere in the column opens the tooltip, not only on the bar itself
+      interaction: round ? { mode: 'nearest', intersect: true } : { mode: 'index', intersect: false, axis: opts.horizontal ? 'y' : 'x' },
+      layout: { padding: { top: 4 } },
+      plugins: {
+        center: { ...(opts.center || {}), ink, muted },
+        legend: {
+          display: multi, position: 'bottom', align: 'start',
+          labels: { color: ink, usePointStyle: true, pointStyle: 'circle', boxWidth: 8, boxHeight: 8, padding: 16, font: { size: 13 } },
+        },
+        tooltip: {
+          backgroundColor: ink, titleColor: surface, bodyColor: surface, padding: 10, cornerRadius: 8,
+          usePointStyle: true, boxWidth: 8, boxHeight: 8, boxPadding: 4, titleFont: { weight: '600' },
+          callbacks: {
+            title: items => opts.titles ? opts.titles[items[0].dataIndex] : items[0].label,
+            label: it => `${multi && !round ? it.dataset.label + ': ' : round ? it.label + ': ' : ''}${fmt(it.raw)}`,
+            afterBody: items => opts.extra ? opts.extra(items[0].dataIndex) : '',
+          },
+        },
+      },
+      scales: round ? {} : opts.horizontal ? { y: catAxis, x: valueAxis } : { x: catAxis, y: valueAxis },
+    },
+  });
+}
+// min-w-0: grid items otherwise grow to their widest table and push the page sideways on phones
+const card = (title, body, cls = '') => `<div class="card bg-base-100 shadow-sm min-w-0 ${cls}"><div class="card-body p-4 sm:p-6"><h2 class="card-title text-base">${title}</h2>${body}</div></div>`;
+const chartBox = id => `<div class="h-64"><canvas id="${id}"></canvas></div><p class="text-xs opacity-60">Tap or hover for values.</p>`;
+
+/* ---------- pages ---------- */
+const pages = {
+  async overview(el) {
+    const [s, h] = await Promise.all([api('GET', '/api/stats'), api('GET', '/api/history')]);
+    const t = s.totals, n = t.tracks || 0;
+    const radial = (label, v) => `<div class="flex flex-col items-center gap-1"><div class="radial-progress text-primary" style="--value:${pct(v, n)};--size:5rem" role="progressbar">${pct(v, n)}%</div><span class="text-sm">${label}</span></div>`;
+    const libs = {};
+    for (const r of s.libraries) (libs[r.id] ??= { ...r, rows: [], total: 0, size: 0 }), r.format && libs[r.id].rows.push(r), libs[r.id].total += r.tracks, libs[r.id].size += r.bytes;
+    el.innerHTML = `
+      <div class="stats shadow w-full bg-base-100 grid-flow-row grid-cols-2 lg:grid-cols-4">
+        <div class="stat"><div class="stat-title">Tracks</div><div class="stat-value">${n.toLocaleString()}</div><div class="stat-desc">${(t.albums || 0).toLocaleString()} albums</div></div>
+        <div class="stat"><div class="stat-title">Library size</div><div class="stat-value">${bytes(t.bytes)}</div><div class="stat-desc">${s.formats.length} format(s)</div></div>
+        <div class="stat"><div class="stat-title">Play time</div><div class="stat-value">${dur(t.seconds)}</div></div>
+        <div class="stat"><div class="stat-title">Review queue</div><div class="stat-value">${s.queue.filter(q => q.status === 'review' || q.status === 'manual').reduce((a, q) => a + q.n, 0)}</div><div class="stat-desc"><a class="link" href="#review">open review</a></div></div>
+      </div>
+      <div class="grid gap-4 mt-4 lg:grid-cols-3">
+        ${card('Library health', `<div class="flex justify-around flex-wrap gap-4 py-2">${radial('MusicBrainz ID', t.with_mbid)}${radial('Cover art', t.with_cover)}${radial('Lyrics', t.with_lyrics)}</div>`)}
+        ${card('Format catalog', `<div class="overflow-x-auto"><table class="table table-sm"><thead><tr><th>Format</th><th class="text-right">Tracks</th><th class="text-right">Size</th><th class="text-right hidden sm:table-cell">Share</th><th class="hidden sm:table-cell">Typical quality</th></tr></thead><tbody>
+          ${s.formats.map(f => {
+            const q = s.quality.find(x => x.format === f.format);
+            return `<tr><td><span class="badge badge-outline">${esc(f.format)}</span><div class="text-xs opacity-70 sm:hidden mt-1">${pct(f.tracks, n)}% · ${esc(q?.quality)}</div></td><td class="text-right">${f.tracks.toLocaleString()}</td><td class="text-right">${bytes(f.bytes)}</td>
+              <td class="text-right hidden sm:table-cell"><progress class="progress progress-primary w-16 align-middle" value="${pct(f.tracks, n)}" max="100"></progress> ${pct(f.tracks, n)}%</td><td class="hidden sm:table-cell">${esc(q?.quality)}</td></tr>`
+          }).join('') || '<tr><td colspan="5" class="opacity-60">No tracks yet. Add a library in Settings and run a scan.</td></tr>'}
+          </tbody><tfoot><tr><th>Total</th><th class="text-right">${n.toLocaleString()}</th><th class="text-right">${bytes(t.bytes)}</th><th class="hidden sm:table-cell"></th><th class="hidden sm:table-cell"></th></tr></tfoot></table></div>`, 'lg:col-span-2')}
+      </div>
+      <div class="grid gap-4 mt-4 md:grid-cols-2 xl:grid-cols-3">
+        ${card('Tracks by format', chartBox('c-formats'))}
+        ${card('Size by format', chartBox('c-size'))}
+        ${card('Audio quality', chartBox('c-quality'))}
+        ${card('Library over time', chartBox('c-growth'))}
+        ${card('Issues per run', chartBox('c-issues'))}
+        ${card('Albums by decade', chartBox('c-decades'))}
+      </div>
+      <h2 class="text-lg font-semibold mt-6 mb-2">Libraries</h2>
+      <div class="grid gap-4 md:grid-cols-2">
+        ${Object.values(libs).map(l => card(`${esc(l.name)} ${l.enabled ? '' : '<span class="badge badge-ghost">disabled</span>'}`, `
+          <p class="text-xs opacity-60 font-mono">${esc(l.path)} · last scan ${when(l.last_scan)}</p>
+          <p><b>${l.total.toLocaleString()}</b> tracks · <b>${bytes(l.size)}</b></p>
+          <div class="flex flex-wrap gap-2">${l.rows.map(r => `<span class="badge">${esc(r.format)} · ${r.tracks.toLocaleString()} · ${bytes(r.bytes)}</span>`).join('')}</div>`)).join('')
+          || `<div class="alert"><span>No libraries yet. ${ME.admin ? '<a class="link" href="#settings">Add one in Settings → Libraries.</a>' : 'Ask an admin to add one.'}</span></div>`}
+      </div>`;
+    const fcolors = s.formats.map(f => formatColor(f.format));
+    chart('c-formats', 'doughnut', s.formats.map(f => f.format), [{ data: s.formats.map(f => f.tracks), backgroundColor: fcolors }],
+      { fmt: v => `${v.toLocaleString()} tracks (${pct(v, n)}%)`, center: { text: compact.format(n), label: 'tracks' } });
+    chart('c-size', 'bar', s.formats.map(f => f.format), [{ label: 'Size', data: s.formats.map(f => f.bytes), backgroundColor: fcolors }],
+      { horizontal: true, fmt: bytes, tick: bytes });
+    const q = s.quality.slice(0, 12);
+    chart('c-quality', 'bar', q.map(x => x.quality), [{ label: 'Tracks', data: q.map(x => x.tracks), backgroundColor: q.map(x => formatColor(x.format)) }],
+      { titles: q.map(x => `${x.format} · ${x.quality}`), fmt: v => `${v.toLocaleString()} tracks` });
+    const snaps = h.snapshots;
+    const day = ts => new Date(ts * 1000).toLocaleDateString(undefined, { day: '2-digit', month: '2-digit' });
+    const titles = snaps.map(x => new Date(x.ts * 1000).toLocaleString());
+    chart('c-growth', 'line', snaps.map(x => day(x.ts)), [{ label: 'Tracks', data: snaps.map(x => x.tracks), borderColor: series(0) }],
+      { titles, fmt: v => `${v.toLocaleString()} tracks`, extra: i => `Size: ${bytes(snaps[i].bytes)}` });
+    chart('c-issues', 'bar', snaps.map(x => day(x.ts)), [
+      { label: 'Fixed', data: snaps.map(x => x.fixed), backgroundColor: STATUS.good },
+      { label: 'Need review', data: snaps.map(x => x.review), backgroundColor: STATUS.warning },
+      { label: 'Still open', data: snaps.map(x => x.open), backgroundColor: STATUS.critical },
+    ], { stacked: true, titles });
+    chart('c-decades', 'bar', s.decades.map(d => d.decade + 's'), [{ label: 'Albums', data: s.decades.map(d => d.albums), backgroundColor: series(0) }],
+      { fmt: v => `${v.toLocaleString()} album(s)` });
+  },
+
+  async library(el) {
+    const st = LIB;
+    const tabs = [['albums', 'Albums'], ['artists', 'Artists'], ['duplicates', 'Duplicates']];
+    el.innerHTML = `
+      <div class="flex flex-col sm:flex-row gap-2 sm:items-center mb-4">
+        <div role="tablist" class="tabs tabs-box w-fit">${tabs.map(([k, l]) => `<a role="tab" class="tab ${k === st.view ? 'tab-active' : ''}" data-lview="${k}">${l}</a>`).join('')}</div>
+        ${st.view !== 'duplicates' ? `<label class="input sm:ml-auto w-full sm:w-72"><span aria-hidden="true">🔎</span><input type="search" id="lib-q" placeholder="Search album, artist, title…" value="${esc(st.q)}"></label>` : ''}
+      </div>
+      ${st.artist && st.view === 'albums' ? `<div class="mb-3"><span class="badge badge-lg gap-2">Artist: ${esc(st.artist)} <button id="lib-clear" aria-label="Clear artist filter">✕</button></span></div>` : ''}
+      <div id="lib-body"></div>`;
+    $$('[data-lview]', el).forEach(a => a.onclick = () => { st.view = a.dataset.lview; st.offset = 0; route() });
+    let timer;
+    $('#lib-q', el)?.addEventListener('input', e => { clearTimeout(timer); timer = setTimeout(() => { st.q = e.target.value; st.offset = 0; renderLib() }, 300) });
+    $('#lib-clear', el)?.addEventListener('click', () => { st.artist = ''; st.offset = 0; route() });
+    await renderLib();
+  },
+
+  async review(el) {
+    const tab = sessionStorage.getItem('reviewTab') || 'review';
+    const list = await api('GET', '/api/proposals?status=' + tab);
+    const tabs = [['review', 'Needs review'], ['manual', 'Needs manual'], ['approved', 'Approved'], ['applied', 'Applied'], ['rejected', 'Ignored']];
+    el.innerHTML = `
+      <div role="tablist" class="tabs tabs-box mb-4 w-fit">${tabs.map(([k, l]) => `<a role="tab" class="tab ${k === tab ? 'tab-active' : ''}" data-tab="${k}">${l}</a>`).join('')}</div>
+      ${tab === 'manual' ? '<div class="alert alert-info mb-4"><span>No confident match was found for these albums. Open one, pick a candidate or paste a MusicBrainz release link, then approve. Not on MusicBrainz? Tick it and <b>Ignore</b>: it is never matched again and stops counting as needing input. Re-match it from the Ignored tab to bring it back.</span></div>' : ''}
+      <div id="bulk" class="hidden sticky top-2 z-10 mb-2 flex flex-wrap items-center gap-2 rounded-box bg-base-100 p-2 shadow">
+        <span class="text-sm font-medium px-2"><span id="bulk-n"></span> selected</span>
+        ${tab !== 'approved' && tab !== 'applied' ? '<button class="btn btn-sm btn-success" data-bulk="approve">Approve</button>' : ''}
+        ${tab !== 'rejected' && tab !== 'applied' ? '<button class="btn btn-sm" data-bulk="reject">Ignore</button>' : ''}
+        <button class="btn btn-sm" data-bulk="rematch">Re-match</button>
+      </div>
+      <div class="card bg-base-100 shadow-sm overflow-x-auto"><table class="table table-zebra">
+        <thead><tr><th class="w-8"><input type="checkbox" class="checkbox checkbox-sm" id="sel-all" aria-label="Select all"></th><th>Album folder</th><th class="hidden md:table-cell">Proposed release</th><th>Confidence</th><th class="hidden md:table-cell">Tracks</th><th class="hidden lg:table-cell">Note</th><th class="hidden lg:table-cell">Updated</th></tr></thead>
+        <tbody>${list.map(p => `<tr class="hover cursor-pointer" data-id="${p.id}">
+          <td><input type="checkbox" class="checkbox checkbox-sm" data-sel="${p.id}" aria-label="Select"></td>
+          <td><div class="font-medium">${shortDir(p.dir)}</div><div class="text-xs opacity-70 md:hidden">${esc(p.release_title || 'no release')} · ${p.tracks} tracks</div></td>
+          <td class="hidden md:table-cell">${esc(p.release_title || '—')}</td>
+          <td><span class="badge ${p.confidence >= .9 ? 'badge-success' : p.confidence >= .7 ? 'badge-warning' : 'badge-error'}">${Math.round((p.confidence || 0) * 100)}%</span></td>
+          <td class="hidden md:table-cell">${p.tracks}</td><td class="hidden lg:table-cell text-xs opacity-70 max-w-xs truncate" title="${esc(p.note)}">${esc(p.note)}</td><td class="hidden lg:table-cell text-xs">${when(p.updated)}</td></tr>`).join('')
+          || '<tr><td colspan="7" class="opacity-60">Nothing here.</td></tr>'}</tbody></table></div>`;
+    $$('[data-tab]', el).forEach(a => a.onclick = () => { sessionStorage.setItem('reviewTab', a.dataset.tab); route() });
+    $$('tr[data-id]', el).forEach(tr => tr.onclick = e => { if (!e.target.closest('td:first-child')) openProposal(tr.dataset.id) });
+    const picked = () => $$('[data-sel]:checked', el).map(i => +i.dataset.sel);
+    const sync = () => { const n = picked().length; $('#bulk-n', el).textContent = n; $('#bulk', el).classList.toggle('hidden', !n) };
+    $$('[data-sel]', el).forEach(i => i.onchange = sync);
+    $('#sel-all', el).onchange = e => { $$('[data-sel]', el).forEach(i => i.checked = e.target.checked); sync() };
+    $$('[data-bulk]', el).forEach(b => b.onclick = guard(async () => {
+      const ids = picked(), action = b.dataset.bulk;
+      if (action === 'approve' && !confirm(`Write the proposed tags to ${ids.length} album(s)?`)) return;
+      await post('/api/proposals/bulk', { action, ids });
+      toast({ approve: `${ids.length} album(s) approved, applying`, reject: `${ids.length} album(s) ignored`, rematch: `Re-matching ${ids.length} album(s)` }[action]);
+      if (action !== 'reject') poll();
+      route();
+    }));
+  },
+
+  async jobs(el) {
+    const [h, iss] = await Promise.all([api('GET', '/api/history'), api('GET', '/api/issues')]);
+    const c = iss.counts || {};
+    el.innerHTML = `
+      <div id="job-card"></div>
+      <div class="card bg-base-100 shadow-sm my-4"><div class="card-body p-4 gap-3 [&_.btn]:h-auto [&_.btn]:min-h-10 [&_.btn]:py-2">
+        <button class="btn btn-primary w-full" data-run="full">▶ Run now <span class="font-normal opacity-80">scan, match, apply</span></button>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <button class="btn" data-run="scan" title="Read new or changed files; writes nothing">🔍 Scan</button>
+          <button class="btn" data-run="apply" title="Write the albums you approved in Review">✅ Apply approved</button>
+          <button class="btn" data-run="covers" title="Cover Art Archive covers for tagged albums with no cover or a small one">🖼️ Fetch covers</button>
+          <button class="btn" data-run="lyrics" title="LRCLIB lyrics for tracks without any (misses are retried after 30 days)">🎤 Fetch lyrics</button>
+        </div>
+        ${ME.admin ? `<div class="divider my-0 text-xs opacity-60">Maintenance</div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <button class="btn btn-sm" data-run="rules" title="Write custom tags and rewrite rules to every file">🏷️ Apply custom tags & rewrites</button>
+          <button class="btn btn-sm btn-error btn-outline" id="undo-all">↩️ Undo all changes</button>
+        </div>` : ''}
+      </div></div>
+      <div class="grid gap-4 lg:grid-cols-2">
+        ${card('Open issues', `<div class="grid grid-cols-2 sm:grid-cols-5 gap-2">
+          ${[['No MB id', c.no_musicbrainz_albumid], ['No cover', c.no_cover], ['Low-res cover', c.small_cover], ['No lyrics', c.no_lyrics], ['No title', c.no_title]].map(([l, v]) => `<div class="rounded-box bg-base-200 p-3"><div class="text-xs opacity-70">${l}</div><div class="text-2xl font-bold">${(v || 0).toLocaleString()}</div></div>`).join('')}</div>
+          <div class="overflow-auto max-h-80"><table class="table table-xs"><thead><tr><th>Album</th><th>Tracks</th><th>No ID</th><th>No cover</th><th>Flags</th></tr></thead><tbody>
+          ${iss.albums.map(a => `<tr><td>${shortDir(a.dir)}</td><td>${a.tracks}</td><td>${a.no_mbid}</td><td>${a.no_cover}</td><td>${a.inconsistent ? '<span class="badge badge-warning badge-xs">inconsistent</span>' : ''}${a.gaps ? '<span class="badge badge-error badge-xs">track gaps</span>' : ''}</td></tr>`).join('')}
+          </tbody></table></div>`)}
+        ${card('Job history', `<div class="overflow-auto max-h-96"><table class="table table-xs"><thead><tr><th>Job</th><th>Started</th><th>Took</th><th>Result</th></tr></thead><tbody>
+          ${h.jobs.map(j => `<tr><td>${esc(j.kind)}</td><td>${when(j.started)}</td><td>${dur(j.finished - j.started)}</td><td class="text-xs">${esc(j.summary)}</td></tr>`).join('') || '<tr><td colspan="4" class="opacity-60">No runs yet.</td></tr>'}
+          </tbody></table></div>`)}
+      </div>`;
+    $$('[data-run]', el).forEach(b => b.onclick = guard(async () => { await post('/api/run', { kind: b.dataset.run }); toast('Job started'); poll() }));
+    $('#undo-all', el)?.addEventListener('click', guard(async () => { if (confirm('Restore the original tags of every file xmusic changed?')) { await post('/api/undo', {}); toast('Undo started'); poll() } }));
+    renderJob(LAST_JOB);
+  },
+
+  async settings(el) {
+    const [s, libs] = await Promise.all([api('GET', '/api/settings'), api('GET', '/api/libraries')]);
+    const tab = sessionStorage.getItem('settingsTab') || 'general';
+    const txt = (k, label, help = '', type = 'text', attrs = '') => `<label class="form-control w-full"><span class="label text-sm font-medium">${label}</span>
+      <input class="input w-full" type="${type}" data-k="${k}" value="${esc(s[k])}" ${attrs}>${help ? `<span class="label text-xs opacity-70 whitespace-normal">${help}</span>` : ''}</label>`;
+    const list = (k, label, help = '') => `<label class="form-control w-full"><span class="label text-sm font-medium">${label}</span>
+      <input class="input w-full" data-list="${k}" value="${esc(s[k].join(', '))}">${help ? `<span class="label text-xs opacity-70 whitespace-normal">${help}</span>` : ''}</label>`;
+    const chk = (k, label) => `<label class="label cursor-pointer justify-start gap-3 whitespace-normal"><input type="checkbox" class="toggle toggle-primary shrink-0" data-k="${k}" ${s[k] ? 'checked' : ''}><span>${label}</span></label>`;
+    // one rule per row; fields stack on phones, sit side by side from sm up
+    const ruleRow = (cols, r = {}) => `<div class="rule-row grid grid-cols-1 sm:grid-cols-[1fr_1fr_1fr_auto] gap-2 items-end p-2 rounded-box bg-base-200 sm:bg-transparent sm:p-0">
+      ${cols.map(c => `<label class="flex flex-col gap-1 min-w-0"><span class="text-xs opacity-70 sm:hidden">${c[1]}</span><input class="input input-sm w-full" data-c="${c[0]}" value="${esc(r[c[0]])}" placeholder="${esc(c[2] || '')}"></label>`).join('')}
+      <button class="btn btn-ghost btn-sm" data-del aria-label="Remove">✕ <span class="sm:hidden">Remove</span></button></div>`;
+    const rowsTable = (k, cols) => `<div class="hidden sm:grid grid-cols-[1fr_1fr_1fr_auto] gap-2 text-xs font-semibold opacity-70 mb-1">${cols.map(c => `<span>${c[1]}</span>`).join('')}<span class="w-12"></span></div>
+      <div class="flex flex-col gap-2" data-rows="${k}">${s[k].map(r => ruleRow(cols, r)).join('')}</div>
+      <button class="btn btn-sm mt-2" data-add="${k}" data-cols='${JSON.stringify(cols)}'>+ Add</button>`;
+    const tabs = { general: 'General', libraries: 'Libraries', metadata: 'Metadata', media: 'Cover & lyrics', notify: 'Integrations' };
+    el.innerHTML = `
+      <div role="tablist" class="tabs tabs-box mb-4 w-fit flex-wrap">${Object.entries(tabs).map(([k, l]) => `<a role="tab" class="tab ${k === tab ? 'tab-active' : ''}" data-stab="${k}">${l}</a>`).join('')}</div>
+      <div class="card bg-base-100 shadow-sm"><div class="card-body gap-4">
+      <div data-pane="general" class="grid gap-4 md:grid-cols-2">
+        ${txt('schedule', 'Scan schedule (cron)', 'Standard 5-field cron, e.g. <code>0 3 * * *</code> = every day at 03:00 (container time zone). Empty = no scheduled runs.')}
+        ${txt('contact_email', 'Contact e-mail', 'Sent in the MusicBrainz User-Agent, as their API rules require.', 'email')}
+        ${txt('match_threshold', 'Match threshold', 'Below this confidence an album goes to “Needs manual”.', 'number', 'step="0.01" min="0" max="1"')}
+        ${txt('io_threads', 'Parallel file operations', 'How many files are read or written at once. Lower is lighter on the NUC and on a network mount (rclone, SMB).', 'number', 'min="1" max="16"')}
+        ${txt('auto_apply_above', 'Auto-apply above', 'At or above this confidence changes are written without review. 0 = always review.', 'number', 'step="0.01" min="0" max="1"')}
+        ${txt('acoustid_key', 'AcoustID API key', 'Free key from acoustid.org; enables fingerprint matching for badly tagged files.')}
+        <div class="flex flex-col gap-2"><span class="text-sm font-medium">Watch mode</span>
+          ${chk('watch_enabled', 'Scan automatically when files in a library change')}
+          ${chk('watch_full_run', 'After changes, do a full run (match + apply) instead of a scan only')}
+          <span class="text-xs opacity-70">Starts 30 s after the last change. Network shares (NFS/SMB) don't report changes; use the schedule for those.</span></div>
+      </div>
+      <div data-pane="libraries">
+        <div class="flex flex-wrap items-center gap-2 mb-2"><button class="btn btn-sm" id="lib-scan">🔄 Scan libraries</button><span class="text-xs opacity-70">Finds new, changed and removed files in every enabled library. No MusicBrainz lookups.</span></div>
+        <table class="table"><thead><tr><th>Library</th><th class="hidden sm:table-cell">Tracks</th><th>On</th><th></th></tr></thead><tbody>
+        ${libs.map(l => `<tr><td class="min-w-0"><div class="font-medium">${esc(l.name)}</div><div class="font-mono text-xs opacity-70 break-all">${esc(l.path)}</div><div class="text-xs opacity-70 sm:hidden">${l.tracks} tracks</div></td>
+          <td class="hidden sm:table-cell">${l.tracks}</td>
+          <td><input type="checkbox" class="toggle toggle-sm toggle-primary" data-lib-toggle="${l.id}" ${l.enabled ? 'checked' : ''}></td>
+          <td><button class="btn btn-ghost btn-sm text-error" data-lib-del="${l.id}">Remove</button></td></tr>`).join('') || '<tr><td colspan="4" class="opacity-60">No libraries yet.</td></tr>'}
+        </tbody></table>
+        <form id="lib-add" class="flex flex-col sm:flex-row gap-2 sm:items-end mt-4">
+          <label class="input w-full sm:w-48"><span class="label">Name</span><input name="name" placeholder="FLAC"></label>
+          <div class="join w-full sm:grow"><label class="input join-item w-full"><span class="label">Path</span><input name="path" placeholder="/music" required></label><button type="button" class="btn join-item" id="lib-browse">📁 Browse…</button></div>
+          <button class="btn btn-primary">Add library</button>
+        </form>
+        <p class="text-xs opacity-70 mt-2">Paths are inside the container: mount your music under <code>/music</code> in docker-compose, then add folders here. Removing a library only forgets it; files are not touched.</p>
+      </div>
+      <div data-pane="metadata" class="grid gap-4">
+        ${list('write_fields', 'Fields xmusic may write', 'Comma-separated; a trailing * matches a prefix (MUSICBRAINZ_*).')}
+        ${list('preserve_fields', 'Never overwrite', 'These are left as they are, even if MusicBrainz has a value.')}
+        <div class="grid gap-4 md:grid-cols-2">${list('prefer_country', 'Preferred release countries', 'e.g. XW, US, GB')}${list('prefer_media', 'Preferred media', 'e.g. Digital Media, CD')}</div>
+        <div><h3 class="font-semibold">Custom tags</h3><p class="text-xs opacity-70 mb-2">Written to every matched album, or to every file in scope with Jobs → “Apply custom tags & rewrites”. Scope: <code>all</code>, <code>path:/music/vinyl</code>, or <code>GENRE=Jazz</code>.</p>
+          ${rowsTable('custom_tags', [['key', 'Tag', 'SOURCE'], ['value', 'Value', 'vinyl'], ['scope', 'Scope', 'all']])}</div>
+        <div><h3 class="font-semibold">Rewrite rules</h3><p class="text-xs opacity-70 mb-2">Regex find/replace on a field, applied after matching (in order).</p>
+          ${rowsTable('rewrites', [['field', 'Field', 'ARTIST'], ['pattern', 'Regex', '(?i) feat\\. '], ['replace', 'Replace with', ' feat. ']])}</div>
+      </div>
+      <div data-pane="media" class="grid gap-4 md:grid-cols-2">
+        <div class="flex flex-col gap-2"><h3 class="font-semibold">Cover art (Cover Art Archive)</h3>${chk('cover_embed', 'Embed front cover in albums without one (a cover.jpg in the folder counts as one)')}${chk('cover_save_file', 'Also save cover.jpg in the album folder')}
+          <label class="form-control"><span class="label text-sm">Size</span><select class="select" data-k="cover_size">${['250', '500', '1200', 'original'].map(v => `<option ${s.cover_size === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+          ${txt('cover_upgrade_below', 'Upgrade covers smaller than (px)', 'Embedded covers below this size are replaced when the Cover Art Archive has a bigger one. 0 = never. Undo restores the original.', 'number', 'min="0" step="50"')}</div>
+        <div class="flex flex-col gap-2"><h3 class="font-semibold">Lyrics (LRCLIB)</h3>${chk('lyrics_enabled', 'Download lyrics')}${chk('lyrics_prefer_synced', 'Prefer time-synced lyrics')}${chk('lyrics_embed', 'Embed in the LYRICS tag')}${chk('lyrics_save_lrc', 'Save a .lrc file next to the track')}</div>
+      </div>
+      <div data-pane="notify" class="grid gap-4 md:grid-cols-2">
+        <h3 class="font-semibold md:col-span-2">Gotify notifications</h3>
+        ${txt('gotify_url', 'Gotify server URL', 'e.g. https://gotify.example.com')}
+        ${txt('gotify_token', 'Application token', '', 'password')}
+        ${txt('gotify_priority', 'Priority', '', 'number', 'min="0" max="10"')}
+        <div class="flex flex-col gap-2">${chk('notify_finished', 'When a run finishes')}${chk('notify_review', 'When albums need review')}${chk('notify_error', 'When a job fails')}</div>
+        ${txt('public_url', 'Dashboard address', 'How you open xmusic, e.g. http://192.168.1.73:8337. Tapping a notification opens the Review or Jobs page there.')}
+        <div><button class="btn" id="notify-test">Send test notification</button><p class="text-xs opacity-70 mt-1">Uses the saved settings, so save first.</p></div>
+        <h3 class="font-semibold md:col-span-2 mt-4">Navidrome</h3>
+        <p class="text-xs opacity-70 md:col-span-2 -mt-2">After a job changes files, xmusic asks Navidrome (or any Subsonic server) to rescan, so fixes show up right away. Leave the URL empty to turn it off.</p>
+        ${txt('navidrome_url', 'Navidrome URL', 'e.g. http://192.168.1.73:4533')}
+        ${txt('navidrome_user', 'User', 'A Navidrome admin: only admins can start a scan.')}
+        ${txt('navidrome_password', 'Password', '', 'password')}
+        <div><button class="btn" id="navidrome-test">Start a Navidrome scan</button><p class="text-xs opacity-70 mt-1">Uses the saved settings, so save first.</p></div>
+      </div>
+      <div class="card-actions justify-end" id="save-row"><button class="btn btn-primary" id="save">Save settings</button></div>
+      </div></div>`;
+    const showPane = k => { $$('[data-pane]', el).forEach(p => p.classList.toggle('hidden', p.dataset.pane !== k)); $('#save-row').classList.toggle('hidden', k === 'libraries') };
+    showPane(tab);
+    $$('[data-stab]', el).forEach(a => a.onclick = () => { sessionStorage.setItem('settingsTab', a.dataset.stab); $$('[data-stab]', el).forEach(x => x.classList.toggle('tab-active', x === a)); showPane(a.dataset.stab) });
+    el.onclick = e => {
+      const del = e.target.closest('[data-del]');
+      if (del) del.closest('.rule-row').remove();
+      if (e.target.matches('[data-add]')) $(`[data-rows="${e.target.dataset.add}"]`, el).insertAdjacentHTML('beforeend', ruleRow(JSON.parse(e.target.dataset.cols)));
+    };
+    $('#save', el).onclick = guard(async () => {
+      const out = { ...s };
+      $$('[data-k]', el).forEach(i => out[i.dataset.k] = i.type === 'checkbox' ? i.checked : i.type === 'number' ? +i.value : i.value);
+      $$('[data-list]', el).forEach(i => out[i.dataset.list] = i.value.split(',').map(x => x.trim()).filter(Boolean));
+      $$('[data-rows]', el).forEach(t => out[t.dataset.rows] = $$('.rule-row', t).map(tr => Object.fromEntries($$('[data-c]', tr).map(i => [i.dataset.c, i.value]))).filter(r => Object.values(r).some(Boolean)));
+      await api('PUT', '/api/settings', out);
+      toast('Settings saved');
+    });
+    $('#notify-test', el).onclick = guard(async () => { await post('/api/notify/test'); toast('Test notification sent') });
+    $('#navidrome-test', el).onclick = guard(async () => { await post('/api/navidrome/test'); toast('Navidrome scan started') });
+    $('#lib-browse', el).onclick = guard(() => browseFolders($('#lib-add [name=path]', el).value, path => {
+      $('#lib-add [name=path]', el).value = path;
+      const name = $('#lib-add [name=name]', el);
+      if (!name.value) name.value = path.split('/').filter(Boolean).pop() || path;
+    }));
+    $('#lib-add', el).onsubmit = guard(async e => { e.preventDefault(); const f = new FormData(e.target); await post('/api/libraries', { name: f.get('name'), path: f.get('path') }); toast('Library added, scanning…'); await startScan(); route() });
+    $('#lib-scan', el).onclick = guard(async () => { await startScan(); toast('Scan started') });
+    $$('[data-lib-toggle]', el).forEach(i => i.onchange = guard(async () => { await post(`/api/libraries/${i.dataset.libToggle}/toggle`) }));
+    $$('[data-lib-del]', el).forEach(b => b.onclick = guard(async () => { if (confirm('Forget this library? Files are not touched.')) { await api('DELETE', `/api/libraries/${b.dataset.libDel}`); route() } }));
+  },
+
+  async users(el) {
+    const users = await api('GET', '/api/users');
+    el.innerHTML = card('Users', `
+      <table class="table"><thead><tr><th>Name</th><th>Role</th><th></th></tr></thead><tbody>
+      ${users.map(u => `<tr><td>${esc(u.name)}</td><td><span class="badge ${u.role === 'admin' ? 'badge-primary' : ''}">${esc(u.role)}</span></td>
+        <td class="text-right"><button class="btn btn-ghost btn-sm" data-pw="${u.id}">Reset password</button>${u.name !== ME.name ? `<button class="btn btn-ghost btn-sm text-error" data-udel="${u.id}">Delete</button>` : ''}</td></tr>`).join('')}
+      </tbody></table>
+      <form id="user-add" class="flex flex-col sm:flex-row sm:flex-wrap gap-2 sm:items-end mt-4">
+        <label class="input w-full sm:w-auto"><span class="label">Name</span><input name="name" required></label>
+        <label class="input w-full sm:w-auto"><span class="label">Password</span><input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
+        <select name="role" class="select w-full sm:w-32"><option value="user">user</option><option value="admin">admin</option></select>
+        <button class="btn btn-primary">Add user</button>
+      </form>
+      <p class="text-xs opacity-70">Users can review and approve changes. Admins can also change settings, libraries and users.</p>`);
+    $('#user-add', el).onsubmit = guard(async e => { e.preventDefault(); const f = new FormData(e.target); await post('/api/users', Object.fromEntries(f)); toast('User added'); route() });
+    $$('[data-udel]', el).forEach(b => b.onclick = guard(async () => { if (confirm('Delete this user?')) { await api('DELETE', `/api/users/${b.dataset.udel}`); route() } }));
+    $$('[data-pw]', el).forEach(b => b.onclick = guard(async () => { const pw = prompt('New password (min 8 characters)'); if (pw) { await post(`/api/users/${b.dataset.pw}/password`, { password: pw }); toast('Password changed') } }));
+  },
+};
+
+/* ---------- proposal modal ---------- */
+async function openProposal(id) {
+  const p = await api('GET', '/api/proposals/' + id);
+  const body = $('#modal-body');
+  const changed = p.tracks.filter(t => Object.keys(t.new).length);
+  body.innerHTML = `
+    <h3 class="text-lg font-bold">${shortDir(p.dir)}</h3>
+    <p class="text-xs font-mono opacity-60 break-all">${esc(p.dir)}</p>
+    <div class="flex flex-wrap gap-2 items-center my-3">
+      <span class="badge badge-lg">${esc(p.status)}</span>
+      <span class="badge badge-lg ${p.confidence >= .9 ? 'badge-success' : p.confidence >= .7 ? 'badge-warning' : 'badge-error'}">${Math.round((p.confidence || 0) * 100)}% confidence</span>
+      ${p.release_id ? `<a class="link" target="_blank" rel="noopener" href="https://musicbrainz.org/release/${esc(p.release_id)}">${esc(p.release_title)} ↗</a>` : '<span class="opacity-60">no release selected</span>'}
+    </div>
+    ${p.note ? `<div class="alert alert-warning text-sm mb-3">${esc(p.note)}</div>` : ''}
+    <div class="collapse collapse-arrow bg-base-200 mb-3 ${p.status === 'manual' ? 'collapse-open' : ''}"><input type="checkbox"><div class="collapse-title font-semibold">Candidates & manual pick</div><div class="collapse-content">
+      <table class="table table-sm"><thead><tr><th>Release</th><th class="hidden sm:table-cell">Date</th><th class="hidden sm:table-cell">Country</th><th class="hidden sm:table-cell">Tracks</th><th>Score</th><th></th></tr></thead><tbody>
+      ${p.candidates.map(c => `<tr><td>${esc(c.artist)} – ${esc(c.title)}<div class="text-xs opacity-70 sm:hidden">${esc(c.date)} · ${esc(c.country)} · ${c.tracks} tracks</div></td>
+        <td class="hidden sm:table-cell">${esc(c.date)}</td><td class="hidden sm:table-cell">${esc(c.country)}</td><td class="hidden sm:table-cell">${c.tracks}</td><td>${Math.round(c.score * 100)}%</td>
+        <td><button class="btn btn-xs" data-pick="${esc(c.id)}" ${c.id === p.release_id ? 'disabled' : ''}>Use</button></td></tr>`).join('') || '<tr><td colspan="6" class="opacity-60">No candidates.</td></tr>'}
+      </tbody></table>
+      <div class="join w-full mt-2"><input id="mbid" class="input join-item grow" placeholder="Paste a MusicBrainz release link or MBID"><button class="btn join-item" id="mbid-use">Use release</button></div>
+    </div></div>
+    <h4 class="font-semibold mb-1">Changes (${changed.length} of ${p.tracks.length} files)</h4>
+    <div class="overflow-y-auto max-h-[50vh] flex flex-col gap-3">
+    ${changed.map(t => `<div class="rounded-box bg-base-200 p-2">
+      <div class="font-medium text-sm break-all mb-1">${esc(t.file)}</div>
+      ${Object.keys(t.new).map(k => `<div class="grid grid-cols-1 sm:grid-cols-[14rem_1fr_1fr] gap-x-3 items-center py-1 border-t border-base-300 text-xs">
+        <span class="font-mono opacity-70">${esc(k)}</span>
+        <span class="text-error line-through break-all">${esc(t.old[k] ?? '')}</span>
+        <input class="input input-sm sm:input-xs w-full text-success" data-edit="${t.id}" data-key="${esc(k)}" value="${esc(t.new[k])}"></div>`).join('')}
+    </div>`).join('') || '<p class="opacity-60 text-sm">No tag changes (cover art and lyrics may still be added).</p>'}
+    </div>
+    <div class="modal-action flex-wrap">
+      <button class="btn btn-ghost" data-rematch title="Look this album up on MusicBrainz again">🔄 Re-match</button>
+      ${p.status === 'applied' ? '<button class="btn btn-error btn-outline" data-act="undo">Undo this album</button>' : ''}
+      ${p.status !== 'rejected' && p.status !== 'applied' ? '<button class="btn btn-ghost" data-act="reject" title="Never match this album again">Ignore</button>' : ''}
+      ${p.status !== 'applied' && p.release_id ? '<button class="btn btn-primary" data-act="approve">Approve & apply</button>' : ''}
+      <form method="dialog"><button class="btn">Close</button></form>
+    </div>`;
+  const reload = () => openProposal(id);
+  $('[data-rematch]', body).onclick = guard(() => rematchAlbum(p.dir));
+  $$('[data-edit]', body).forEach(i => i.onchange = guard(async () => { await post(`/api/proposals/${id}/edit`, { track_id: +i.dataset.edit, key: i.dataset.key, value: i.value }); toast('Saved') }));
+  // picking a release looks it up on MusicBrainz (a second or more): lock the pickers and spin on the clicked one
+  const pick = (btn, release_id) => guard(async () => {
+    const locked = $$('[data-pick], #mbid, #mbid-use', body), label = btn.innerHTML;
+    locked.forEach(e => e.disabled = true);
+    btn.innerHTML = '<span class="loading loading-spinner loading-xs"></span>';
+    try { await post(`/api/proposals/${id}/pick`, { release_id: release_id() }); reload() }
+    catch (e) { locked.forEach(x => x.disabled = false); btn.innerHTML = label; throw e }
+  })();
+  $$('[data-pick]', body).forEach(b => b.onclick = () => pick(b, () => b.dataset.pick));
+  $('#mbid-use', body).onclick = e => pick(e.currentTarget, () => $('#mbid', body).value);
+  $('#mbid', body).onkeydown = e => { if (e.key === 'Enter') $('#mbid-use', body).click() };
+  $$('[data-act]', body).forEach(b => b.onclick = guard(async () => {
+    const a = b.dataset.act;
+    if (a === 'undo') await post('/api/undo', { dir: p.dir });
+    else { const r = await post(`/api/proposals/${id}/${a}`); if (a === 'approve' && !r.applying) toast('Approved; it joins the running job or is applied right after it', 'info') }
+    $('#modal').close(); toast(a === 'reject' ? 'Ignored' : 'Done'); route(); poll();
+  }));
+  $('#modal').showModal();
+}
+
+// a scan can't start while another job runs; say so instead of failing silently
+async function startScan() {
+  try { await post('/api/run', { kind: 'scan' }); poll() }
+  catch (e) { toast(e.message === 'a job is already running' ? 'A job is running; scan again when it finishes' : e.message, 'warning') }
+}
+
+/* ---------- re-match ---------- */
+// the job runs in the background; when it ends, poll() opens the resulting proposal
+let REMATCH_DIR = null;
+async function rematchAlbum(dir) {
+  await post('/api/rematch', { dir });
+  REMATCH_DIR = dir;
+  $('#modal').close();
+  toast('Re-matching with MusicBrainz… the result opens here when it is ready', 'info');
+  poll();
+}
+async function showProposalFor(dir) {
+  try { const a = await post('/api/library/album', { dir }); if (a.proposal) openProposal(a.proposal.id) } catch {}
+}
+
+/* ---------- library ---------- */
+const LIB = { view: 'albums', q: '', artist: '', offset: 0 };
+const coverImg = (id, cls) => `<img src="/api/cover/${id}" loading="lazy" alt="" class="${cls} object-cover bg-base-300" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'${cls} bg-base-300 grid place-items-center text-3xl',textContent:'🎵'}))">`;
+const fmtBadges = f => String(f || '').split(',').filter(Boolean).map(x => `<span class="badge badge-xs badge-outline">${esc(x)}</span>`).join(' ');
+
+async function renderLib(append = false) {
+  const body = $('#lib-body');
+  if (!body) return;
+  if (LIB.view === 'duplicates') return renderDupes(body);
+  const list = await post('/api/library', { view: LIB.view, q: LIB.q, artist: LIB.artist, offset: LIB.offset });
+  if (LIB.view === 'artists') {
+    body.innerHTML = `<ul class="menu bg-base-100 rounded-box shadow-sm w-full">${list.map(a => `<li><a data-artist="${esc(a.artist ?? '')}" class="flex justify-between">
+      <span class="font-medium truncate">${esc(a.artist || 'Unknown artist')}</span><span class="text-xs opacity-70 shrink-0">${a.albums} album(s) · ${a.tracks} tracks</span></a></li>`).join('') || '<li class="disabled"><span>No artists found.</span></li>'}</ul>`;
+    $$('[data-artist]', body).forEach(a => a.onclick = () => { LIB.artist = a.dataset.artist; LIB.view = 'albums'; LIB.offset = 0; route() });
+    return;
+  }
+  const more = list.length > 60;
+  const cards = list.slice(0, 60).map(a => `<button class="card bg-base-100 shadow-sm text-left hover:shadow-md transition-shadow min-w-0" data-dir="${esc(a.dir)}">
+      <figure>${coverImg(a.cover_id, 'w-full aspect-square')}</figure>
+      <div class="p-3 flex flex-col gap-1 min-w-0">
+        <span class="font-semibold text-sm truncate" title="${esc(a.album || a.dir)}">${esc(a.album || shortDir(a.dir))}</span>
+        <span class="text-xs opacity-70 truncate">${esc(a.artist || 'Unknown artist')}${a.year ? ' · ' + esc(a.year) : ''}</span>
+        <span class="flex flex-wrap gap-1 items-center">${fmtBadges(a.formats)}<span class="text-xs opacity-60">${a.tracks} tr</span>${a.tagged ? '' : '<span class="badge badge-xs badge-warning" title="No MusicBrainz ID">untagged</span>'}</span>
+      </div></button>`).join('');
+  if (!append) body.innerHTML = `<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-3" id="lib-grid"></div><div id="lib-more" class="flex justify-center mt-4"></div>`;
+  if (!list.length && !append) $('#lib-grid').innerHTML = '<p class="opacity-60 col-span-full">No albums found.</p>';
+  $('#lib-grid').insertAdjacentHTML('beforeend', cards);
+  $('#lib-more').innerHTML = more ? '<button class="btn">Load more</button>' : '';
+  $('#lib-more button')?.addEventListener('click', () => { LIB.offset += 60; renderLib(true) });
+  $$('#lib-grid [data-dir]:not([data-bound])').forEach(b => { b.dataset.bound = 1; b.onclick = guard(() => openAlbum(b.dataset.dir)) });
+}
+
+async function openAlbum(dir) {
+  const a = await post('/api/library/album', { dir });
+  const t0 = a.tracks.map(t => ({ ...t, tags: JSON.parse(t.tags || '{}') }));
+  const g = k => t0.map(t => t.tags[k]).find(Boolean);
+  const total = t0.reduce((x, t) => x + t.size, 0), secs = t0.reduce((x, t) => x + t.duration, 0);
+  const coverId = (t0.find(t => t.has_cover) || t0[0])?.id;
+  const mbid = g('MUSICBRAINZ_ALBUMID');
+  const quality = t => t.bit_depth ? `${t.bit_depth}-bit / ${t.sample_rate / 1000} kHz` : `${t.bitrate} kbps`;
+  const body = $('#modal-body');
+  body.innerHTML = `
+    <div class="flex flex-col sm:flex-row gap-4">
+      ${coverImg(coverId, 'w-40 h-40 rounded-box shrink-0 self-center sm:self-start')}
+      <div class="min-w-0 flex flex-col gap-1">
+        <h3 class="text-xl font-bold break-words">${esc(g('ALBUM') || shortDir(dir))}</h3>
+        <p class="opacity-80">${esc(g('ALBUMARTIST') || g('ARTIST') || 'Unknown artist')}${g('DATE') ? ' · ' + esc(g('DATE')) : ''}</p>
+        <p class="text-sm opacity-70">${t0.length} tracks · ${dur(secs)} · ${bytes(total)}</p>
+        <div class="flex flex-wrap gap-1">${fmtBadges([...new Set(t0.map(t => t.format))].join(','))}
+          ${t0.some(t => t.has_cover) ? `<span class="badge badge-xs">cover ${Math.max(...t0.map(t => t.cover_px)) || '?'}px</span>` : a.cover_file ? '<span class="badge badge-xs" title="cover.jpg next to the files, not embedded">cover file</span>' : '<span class="badge badge-xs badge-warning">no cover</span>'}
+          ${(n => `<span class="badge badge-xs ${n === t0.length ? '' : 'badge-warning'}">lyrics ${n}/${t0.length}</span>`)(t0.filter(t => t.has_lyrics).length)}</div>
+        <div class="flex flex-wrap gap-2 mt-1 text-sm">
+          ${mbid ? `<a class="link" target="_blank" rel="noopener" href="https://musicbrainz.org/release/${esc(mbid)}">MusicBrainz ↗</a>` : '<span class="badge badge-warning badge-sm">no MusicBrainz ID</span>'}
+          ${a.proposal ? `<a class="link" data-proposal="${a.proposal.id}">Proposal (${esc(a.proposal.status)})</a>` : ''}
+          <button class="btn btn-xs" data-rematch title="Look this album up on MusicBrainz again and propose fixes for wrong titles and tags">🔄 Re-match</button></div>
+        <p class="text-xs font-mono opacity-50 break-all">${esc(dir)}</p>
+      </div>
+    </div>
+    <div class="flex flex-col mt-4 max-h-[50vh] overflow-y-auto">
+      ${t0.map(t => `<details class="border-t border-base-300">
+        <summary class="grid grid-cols-[2rem_1fr_auto] gap-2 py-2 cursor-pointer items-center text-sm">
+          <span class="opacity-60 text-right">${esc(t.tags.TRACKNUMBER || '')}</span>
+          <span class="min-w-0"><span class="block truncate">${esc(t.tags.TITLE || t.path.split('/').pop())}</span>
+            <span class="block text-xs opacity-60 truncate">${esc(t.tags.ARTIST || '')} · ${esc(t.format)} ${esc(quality(t))}</span></span>
+          <span class="flex items-center gap-2 text-xs">${t.has_lyrics ? '<span class="badge badge-xs badge-success badge-outline" title="Has lyrics (embedded or .lrc)">lyrics</span>' : '<span class="badge badge-xs badge-ghost opacity-60" title="No lyrics yet">no lyrics</span>'}<span class="opacity-70">${dur(t.duration)}</span></span></summary>
+        <dl class="grid grid-cols-[minmax(6rem,12rem)_1fr] gap-x-3 gap-y-1 text-xs pb-3 pl-10">
+          ${Object.entries(t.tags).filter(([k]) => k !== 'LYRICS').map(([k, v]) => `<dt class="font-mono opacity-60 break-all">${esc(k)}</dt><dd class="break-all">${esc(v)}</dd>`).join('')}
+          <dt class="font-mono opacity-60">FILE</dt><dd class="break-all">${esc(t.path.split('/').pop())} · ${bytes(t.size)}</dd>
+        </dl></details>`).join('')}
+    </div>
+    <div class="modal-action"><form method="dialog"><button class="btn">Close</button></form></div>`;
+  $('[data-proposal]', body)?.addEventListener('click', guard(() => openProposal(a.proposal.id)));
+  $('[data-rematch]', body).addEventListener('click', guard(() => rematchAlbum(dir)));
+  if (!$('#modal').open) $('#modal').showModal();
+}
+
+let DUP_I = 0;
+async function renderDupes(body) {
+  const d = await api('GET', '/api/duplicates');
+  const spare = g => g.dirs.slice(1).reduce((n, x) => n + x.bytes, 0);
+  const total = d.groups.reduce((n, g) => n + spare(g), 0);
+  const trashed = d.trash.reduce((n, t) => n + t.bytes, 0);
+  DUP_I = Math.min(DUP_I, Math.max(d.groups.length - 1, 0));
+  const g = d.groups[DUP_I];
+  const copy = (x, best) => `<div class="rounded-box border ${best ? 'border-success' : 'border-base-300'} p-3 flex flex-col gap-2 min-w-0">
+      <div class="flex gap-3 items-center min-w-0">${coverImg(x.cover_id, 'w-16 h-16 rounded shrink-0')}
+        <div class="min-w-0"><div class="flex flex-wrap gap-1 items-center">${fmtBadges(x.formats)}${best ? '<span class="badge badge-sm badge-success">best quality</span>' : ''}</div>
+          <div class="text-sm mt-1">${x.tracks} tracks · ${bytes(x.bytes)} · ${x.bit_depth ? x.bit_depth + '-bit' : '~' + Math.round(x.bitrate || 0) + ' kbps'}</div></div></div>
+      <button class="link link-hover font-mono text-xs break-all text-left" data-dir="${esc(x.dir)}">${esc(x.dir)}</button>
+      ${ME.admin ? `<button class="btn btn-sm ${best ? 'btn-success' : 'btn-outline'} mt-auto" data-keep="${esc(x.dir)}">Keep this copy</button>` : ''}</div>`;
+  body.innerHTML = `
+    <div class="alert mb-4 flex-wrap"><span>${d.groups.length ? `<b>${d.groups.length}</b> album(s) found more than once · extra copies use <b>${bytes(total)}</b>. Pick the copy to keep: the others move to <code>.xmusic-trash</code> in their library, where you can restore them.` : 'No duplicates found.'}</span></div>
+    ${g ? `<div class="card bg-base-100 shadow-sm"><div class="card-body p-4 gap-3">
+      <div class="flex items-center gap-2">
+        <button class="btn btn-sm btn-square" data-step="-1" ${DUP_I ? '' : 'disabled'} aria-label="Previous">‹</button>
+        <input type="range" class="range range-xs grow" min="0" max="${d.groups.length - 1}" value="${DUP_I}" id="dup-range" aria-label="Finding" ${d.groups.length > 1 ? '' : 'disabled'}>
+        <button class="btn btn-sm btn-square" data-step="1" ${DUP_I < d.groups.length - 1 ? '' : 'disabled'} aria-label="Next">›</button>
+        <span class="text-sm opacity-70 shrink-0">${DUP_I + 1} / ${d.groups.length}</span>
+      </div>
+      <h2 class="text-lg font-semibold">${esc(g.album || 'Untitled')} <span class="font-normal opacity-70">· ${esc(g.artist || 'Unknown artist')}</span></h2>
+      <p class="text-xs opacity-70 -mt-2">${esc(g.reason)} · ${g.dirs.length} copies · keeping the best frees ${bytes(spare(g))}</p>
+      <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">${g.dirs.map((x, i) => copy(x, i === 0)).join('')}</div>
+    </div></div>` : ''}
+    ${d.mixed_folders.length ? `<details class="collapse collapse-arrow bg-base-100 shadow-sm mt-4"><summary class="collapse-title font-semibold">Folders with more than one format (${d.mixed_folders.length})</summary>
+      <div class="collapse-content"><p class="text-sm opacity-70 mb-2">Each folder is matched as one album, so mixed copies can confuse matching. Keep one format per folder.</p>
+      ${d.mixed_folders.map(x => `<div class="flex flex-wrap gap-2 items-center py-1 border-t border-base-300">${fmtBadges(x.formats)}<button class="link link-hover font-mono text-xs break-all text-left" data-dir="${esc(x.dir)}">${esc(x.dir)}</button></div>`).join('')}</div></details>` : ''}
+    ${d.trash.length ? `<details class="collapse collapse-arrow bg-base-100 shadow-sm mt-4"><summary class="collapse-title font-semibold">Moved to trash (${d.trash.length} · ${bytes(trashed)})</summary>
+      <div class="collapse-content"><p class="text-sm opacity-70 mb-2">The space is freed once you delete the <code>.xmusic-trash</code> folder in your library. xmusic never deletes music itself.</p>
+      ${d.trash.map(t => `<div class="flex flex-wrap gap-2 items-center py-1 border-t border-base-300"><span class="font-mono text-xs break-all grow">${esc(t.dir)}</span><span class="text-xs opacity-70">${bytes(t.bytes)} · ${when(t.ts)}</span>
+        ${ME.admin ? `<button class="btn btn-xs" data-restore="${t.id}">Restore</button>` : ''}</div>`).join('')}</div></details>` : ''}`;
+  $$('[data-dir]', body).forEach(b => b.onclick = guard(() => openAlbum(b.dataset.dir)));
+  $$('[data-step]', body).forEach(b => b.onclick = () => { DUP_I += +b.dataset.step; renderDupes(body) });
+  $('#dup-range', body)?.addEventListener('change', e => { DUP_I = +e.target.value; renderDupes(body) });
+  $$('[data-keep]', body).forEach(b => b.onclick = guard(async () => {
+    const others = g.dirs.filter(x => x.dir !== b.dataset.keep);
+    if (!confirm(`Keep ${b.dataset.keep}?\n\n${others.length} other copy(ies), ${bytes(others.reduce((n, x) => n + x.bytes, 0))}, move to .xmusic-trash (restorable).`)) return;
+    const r = await post('/api/duplicates/keep', { dir: b.dataset.keep });
+    toast(`${r.moved} copy(ies) moved to trash`);
+    renderDupes(body);
+  }));
+  $$('[data-restore]', body).forEach(b => b.onclick = guard(async () => { await post(`/api/trash/${b.dataset.restore}/restore`); toast('Restored, rescanning'); poll(); renderDupes(body) }));
+}
+
+/* ---------- folder picker ---------- */
+async function browseFolders(start, onPick) {
+  let d;
+  try { d = await post('/api/browse', { path: start || '' }) } catch { d = await post('/api/browse', { path: '' }) } // typed path invalid → start at root
+  const body = $('#modal-body');
+  const rel = d.path.slice(d.root.length).split('/').filter(Boolean);
+  const crumbs = [[d.root, d.root]].concat(rel.map((n, i) => [n, d.root.replace(/\/$/, '') + '/' + rel.slice(0, i + 1).join('/')]));
+  body.innerHTML = `
+    <h3 class="text-lg font-bold mb-2">Choose a library folder</h3>
+    <div class="breadcrumbs text-sm"><ul>${crumbs.map(([n, p]) => `<li><a data-go="${esc(p)}">${esc(n)}</a></li>`).join('')}</ul></div>
+    <p class="text-xs opacity-70 mb-2">${d.audio_files} audio file(s) directly in this folder · subfolders are included when scanning</p>
+    <ul class="menu bg-base-200 rounded-box w-full max-h-[50vh] overflow-y-auto flex-nowrap">
+      ${d.parent ? `<li><a data-go="${esc(d.parent)}">⬆️ ..</a></li>` : ''}
+      ${d.dirs.map(n => `<li><a data-go="${esc(d.path.replace(/\/$/, '') + '/' + n)}">📁 ${esc(n)}</a></li>`).join('') || '<li class="disabled"><span>No subfolders</span></li>'}
+    </ul>
+    <div class="modal-action flex-wrap">
+      <span class="font-mono text-xs break-all grow self-center">${esc(d.path)}</span>
+      <form method="dialog"><button class="btn">Cancel</button></form>
+      <button class="btn btn-primary" id="pick-folder">Use this folder</button>
+    </div>`;
+  $$('[data-go]', body).forEach(a => a.onclick = guard(() => browseFolders(a.dataset.go, onPick)));
+  $('#pick-folder', body).onclick = () => { onPick(d.path); $('#modal').close() };
+  if (!$('#modal').open) $('#modal').showModal();
+}
+
+/* ---------- job polling ---------- */
+let LAST_JOB = null;
+function renderJob(j) {
+  const el = $('#job-card');
+  if (!el || !j) return;
+  if (!j.running) {
+    el.innerHTML = `<div class="alert"><span>No job running.${j.last ? ` Last: ${esc(j.last)}` : ''}</span></div>`;
+    return;
+  }
+  const p = j.total ? pct(j.done, j.total) : null;
+  el.innerHTML = card(`Running: ${esc(j.kind)}`, `
+    <div>${cancelBtn(j, 'btn-sm btn-error btn-outline', 'Cancel job')}</div>
+    <div class="flex justify-between text-sm"><span>Phase: <b>${esc(j.phase)}</b> ${j.total ? `(${j.done.toLocaleString()} / ${j.total.toLocaleString()})` : ''}</span><span>started ${when(j.started)}</span></div>
+    ${p === null ? '<progress class="progress progress-primary w-full"></progress>' : `<progress class="progress progress-primary w-full" value="${p}" max="100"></progress>`}
+    <div class="stats stats-horizontal">
+      <div class="stat p-3"><div class="stat-title">This phase</div><div class="stat-value text-2xl">${j.phase_eta != null ? '~' + dur(j.phase_eta) : '—'}</div></div>
+      <div class="stat p-3"><div class="stat-title">Whole run (estimate)</div><div class="stat-value text-2xl">${j.eta != null ? '~' + dur(j.eta) : '—'}</div><div class="stat-desc">done ≈ ${j.eta != null ? new Date(Date.now() + j.eta * 1000).toLocaleTimeString() : '—'}</div></div>
+    </div>
+    ${j.upcoming.length ? `<ul class="steps steps-vertical sm:steps-horizontal text-xs"><li class="step step-primary">${esc(j.phase.split(':')[0])}</li>${j.upcoming.map(([n, c]) => `<li class="step">${esc(n)} (${c})</li>`).join('')}</ul>` : ''}`);
+}
+async function poll() {
+  let j;
+  try { j = await api('GET', '/api/job') } catch { return }
+  $('#tasks-dot').classList.toggle('hidden', !j.running);
+  if (LAST_JOB?.running && !j.running) {
+    toast(j.last || 'Job finished', 'info'); route(); refreshBanner(); loadRecent();
+    if (REMATCH_DIR) { const dir = REMATCH_DIR; REMATCH_DIR = null; showProposalFor(dir) }
+  }
+  LAST_JOB = j;
+  renderJob(j);
+  renderTasks();
+  renderRunbar();
+}
+
+// running-job indicators outside the Jobs page: sidebar badge + a bar on top of Overview
+function renderRunbar() {
+  const j = LAST_JOB, p = j?.total ? pct(j.done, j.total) : null;
+  $('#nav-jobs').textContent = p === null ? 'running' : p + '%';
+  $('#nav-jobs').classList.toggle('hidden', !j?.running);
+  const on = j?.running && (location.hash.slice(1) || 'overview') === 'overview';
+  $('#runbar').innerHTML = on ? `<div class="alert alert-info flex flex-wrap">
+      <span class="loading loading-spinner loading-sm"></span>
+      <div class="grow min-w-0"><div class="font-medium">${esc(j.kind)} · ${esc(j.phase)}${j.total ? ` (${j.done.toLocaleString()} / ${j.total.toLocaleString()})` : ''}</div>
+        <div class="text-xs">${j.eta != null ? '~' + dur(j.eta) + ' left' : 'estimating…'}</div>
+        ${p === null ? '' : `<progress class="progress w-full max-w-md" value="${p}" max="100"></progress>`}</div>
+      ${cancelBtn(j, 'btn-sm btn-ghost')}<a class="btn btn-sm" href="#jobs">Open job</a></div>` : '';
+}
+// after a cancel the job still finishes the file it is writing, so say so instead of offering Cancel again
+function cancelBtn(j, cls, label = 'Cancel') {
+  return j.cancelling ? '<span class="badge badge-warning">Cancelling…</span>' : `<button class="btn ${cls}" data-cancel>${label}</button>`;
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('[data-cancel]')) return;
+  guard(async () => { if (confirm(`Cancel "${LAST_JOB?.kind}"? It stops after the file it is writing; changes already written stay (undo still works).`)) { await post('/api/job/cancel'); toast('Cancelling…', 'info'); poll() } })();
+});
+
+/* ---------- tasks dropdown (clock icon) ---------- */
+let RECENT = [];
+async function loadRecent() {
+  try { RECENT = (await api('GET', '/api/history')).jobs.slice(0, 5) } catch { return }
+  renderTasks();
+}
+function renderTasks() {
+  const j = LAST_JOB, el = $('#tasks-body');
+  if (!el || !j) return;
+  const p = j.total ? pct(j.done, j.total) : null;
+  el.innerHTML = `
+    <h3 class="font-semibold text-sm">Running</h3>
+    ${j.running ? `<div class="flex flex-col gap-1">
+        <div class="flex justify-between text-sm gap-2"><span class="font-medium">${esc(j.kind)}</span><span class="opacity-70 shrink-0">${j.eta != null ? '~' + dur(j.eta) + ' left' : ''}</span></div>
+        <div class="text-xs opacity-70">${esc(j.phase)}${j.total ? ` · ${j.done.toLocaleString()} / ${j.total.toLocaleString()}` : ''}</div>
+        ${p === null ? '<progress class="progress progress-info w-full"></progress>' : `<progress class="progress progress-info w-full" value="${p}" max="100"></progress>`}
+        ${j.upcoming.length ? `<div class="text-xs opacity-70">Next: ${j.upcoming.map(([n, c]) => `${esc(n)} (${c})`).join(' → ')}</div>` : ''}
+        <div>${cancelBtn(j, 'btn-xs btn-error btn-outline w-fit')}</div>
+      </div>` : '<p class="text-sm opacity-70">Nothing running.</p>'}
+    <h3 class="font-semibold text-sm mt-1">Recent</h3>
+    <ul class="flex flex-col gap-2">${RECENT.map(r => `<li class="text-xs">
+        <div class="flex justify-between gap-2"><span class="font-medium text-sm">${esc(r.kind)}</span><span class="opacity-70 shrink-0">${when(r.finished)} · ${dur(r.finished - r.started)}</span></div>
+        <div class="opacity-70 line-clamp-2" title="${esc(r.summary)}">${esc(r.summary)}</div></li>`).join('') || '<li class="text-sm opacity-70">No tasks yet.</li>'}</ul>
+    <a href="#jobs" class="btn btn-sm btn-ghost justify-start px-0">Open Jobs →</a>`;
+}
+// fresh history each time the dropdown opens
+$('#tasks [role=button]').addEventListener('focus', loadRecent);
+
+async function refreshBanner() {
+  const s = await api('GET', '/api/stats');
+  const n = s.queue.filter(q => q.status === 'review' || q.status === 'manual').reduce((a, q) => a + q.n, 0);
+  $('#nav-review').textContent = n; $('#nav-review').classList.toggle('hidden', !n);
+  $('#banner').innerHTML = n && !LAST_JOB?.running ? `<div class="alert alert-warning"><span>⚠️ ${n} album(s) need your input.</span><a class="btn btn-sm" href="#review">Review now</a></div>` : '';
+}
+
+/* ---------- router ---------- */
+const titles = { overview: 'Overview', library: 'Library', review: 'Review', jobs: 'Jobs', settings: 'Settings', users: 'Users' };
+async function route() {
+  let page = location.hash.slice(1) || 'overview';
+  if (!pages[page] || (!ME.admin && (page === 'settings' || page === 'users'))) page = 'overview';
+  $('#page-title').textContent = titles[page];
+  $$('[data-page]').forEach(s => s.classList.toggle('hidden', s.dataset.page !== page));
+  $$('.drawer-side a').forEach(a => a.classList.toggle('menu-active', a.getAttribute('href') === '#' + page));
+  $('#nav').checked = false;
+  renderRunbar();
+  await guard(pages[page])($(`[data-page="${page}"]`));
+}
+// focus keeps daisyUI dropdowns open, so drop it on navigation
+window.onhashchange = () => { $('#modal').close(); document.activeElement?.blur(); route() };
+
+async function boot() {
+  try { ME = await api('GET', '/api/me') } catch { return }
+  $('#auth').classList.add('hidden'); $('#app').classList.remove('hidden');
+  $('#me').textContent = '👤 ' + ME.name;
+  $$('.admin').forEach(e => e.classList.toggle('hidden', !ME.admin));
+  await poll();
+  route(); refreshBanner();
+}
+setInterval(() => { if (ME && !$('#app').classList.contains('hidden')) poll() }, 2000);
+boot();
+</script>
+</body>
+</html>

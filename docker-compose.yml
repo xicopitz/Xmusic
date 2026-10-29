@@ -1,0 +1,14 @@
+services:
+  xmusic:
+    build: .
+    container_name: xmusic
+    restart: unless-stopped
+    user: "1000:1000"
+    cpus: "1.5"
+    ports:
+      - "8337:8337"
+    environment:
+      TZ: UTC # time zone for the scan schedule, e.g. Europe/Lisbon
+    volumes:
+      - ./data:/data # database (users, settings, undo log)
+      - /music:/music # then add /music/... folders as libraries in Settings
