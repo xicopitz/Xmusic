@@ -14,6 +14,7 @@ JSON document in the database. Changes apply to the next job; the schedule and w
 | Match threshold | 0.80 | Below this confidence an album goes to *Needs manual* |
 | Auto-apply above | 0.95 | At or above this confidence changes are written without review. 0 = always review |
 | Parallel file operations | 3 | How many files are read or written at once. Lower is lighter on the CPU and on network mounts |
+| Max parallel jobs | 1 | Jobs that may run at once (1–8). See [Parallel jobs](jobs-and-automation.md#parallel-jobs) |
 | AcoustID API key | empty | Enables fingerprint matching for badly tagged files. Use an *application* key; **Test key** checks it and `fpcalc` |
 | Search Discogs | on | Second source when MusicBrainz has no good match |
 | Discogs token | empty | Optional personal access token: 60 lookups a minute instead of 25 |

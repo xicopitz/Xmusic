@@ -56,6 +56,14 @@ fn err(code: u16, msg: &str) -> Resp {
     json_resp(code, json!({ "error": msg }))
 }
 
+/// A job start as a reply: 409 says why it couldn't start.
+fn started(r: Result<(), String>) -> Resp {
+    match r {
+        Ok(()) => ok(json!({"ok": true})),
+        Err(e) => err(409, &e),
+    }
+}
+
 fn with_session(r: Resp, token: &str) -> Resp {
     r.with_header(header("Set-Cookie", &format!("{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000", auth::COOKIE)))
 }
@@ -167,7 +175,7 @@ fn hook(c: &Connection, query: &str, authorization: Option<&str>, body: &Value) 
             let started = job::import(dirs);
             ok(json!({ "albums": n, "started": started, "queued": !started }))
         }
-        None if HOOK_SCAN_EVENTS.contains(&event) => ok(json!({ "scan": job::start(job::Kind::Scan) })),
+        None if HOOK_SCAN_EVENTS.contains(&event) => ok(json!({ "scan": job::start(job::Kind::Scan).is_ok() })),
         None => ok(json!({ "ignored": event })),
     }
 }
@@ -258,7 +266,7 @@ fn files(req: &mut Request) -> Option<ResponseBox> {
     }
     job::reschedule();
     crate::watch::reload();
-    job::start(job::Kind::Scan); // the library may have changed since the backup
+    job::start(job::Kind::Scan).ok(); // the library may have changed since the backup
     Some(ok(json!({"ok": true})).boxed())
 }
 
@@ -361,8 +369,12 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
             "snapshots": rows(c, "SELECT * FROM (SELECT * FROM stats_snapshots ORDER BY ts DESC LIMIT 60) ORDER BY ts", []),
             "jobs": rows(c, "SELECT * FROM jobs ORDER BY id DESC LIMIT 30", []),
         })),
-        (Method::Get, ["api", "job"]) => ok(serde_json::to_value(job::status()).unwrap()),
-        (Method::Post, ["api", "job", "cancel"]) => if job::cancel() { ok(json!({"ok": true})) } else { err(409, "no job is running") },
+        (Method::Get, ["api", "job"]) => {
+            let mut st = serde_json::to_value(job::status()).unwrap();
+            st["max"] = json!(job::max_jobs());
+            ok(st)
+        }
+        (Method::Post, ["api", "job", "cancel"]) => if job::cancel(body["id"].as_u64()) { ok(json!({"ok": true})) } else { err(409, "no such job is running") },
         (Method::Post, ["api", "run"]) => {
             let kind = match s("kind").as_str() {
                 "full" => job::Kind::Full,
@@ -374,14 +386,14 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
                 "rules" if user.admin => job::Kind::Rules,
                 _ => return err(400, "unknown or forbidden job kind"),
             };
-            if job::start(kind) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
+            started(job::start(kind))
         }
         (Method::Post, ["api", "undo"]) => {
             let dir = body["dir"].as_str().map(String::from);
             if dir.is_none() && admin_only {
                 return err(403, "admin only");
             }
-            if job::start(job::Kind::Undo(dir)) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
+            started(job::start(job::Kind::Undo(dir)))
         }
         (Method::Get, ["api", "issues"]) => ok(issues(c)),
         (Method::Post, ["api", "rematch"]) => {
@@ -389,7 +401,7 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
             if c.query_row("SELECT 1 FROM tracks WHERE dir=?1 LIMIT 1", [&dir], |_| Ok(())).is_err() {
                 return err(404, "album folder not found in the library");
             }
-            if job::start(job::Kind::Rematch(vec![dir])) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
+            started(job::start(job::Kind::Rematch(vec![dir])))
         }
         (Method::Post, ["api", "album", "fetch"]) => {
             let dir = s("dir");
@@ -401,7 +413,7 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
                 "lyrics" => job::Kind::Lyrics(Some(vec![dir])),
                 _ => return err(400, "what must be covers or lyrics"),
             };
-            if job::start(kind) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
+            started(job::start(kind))
         }
         (Method::Post, ["api", "library"]) => ok(library(c, body)),
         (Method::Post, ["api", "library", "album"]) => ok(album(c, &s("dir"))),
@@ -465,7 +477,7 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
         }
         (Method::Post, ["api", "health", "discs"]) => {
             let dirs = body["dir"].as_str().map(|d| vec![d.to_string()]);
-            if job::start(job::Kind::Discs(dirs)) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
+            started(job::start(job::Kind::Discs(dirs)))
         }
         (Method::Post, ["api", "health", "spelling"]) => {
             let to = s("to");
@@ -473,8 +485,8 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
             if to.trim().is_empty() || from.is_empty() {
                 return err(400, "pick a spelling and at least one other");
             }
-            if !job::start(job::Kind::Rename(from.clone(), to.clone())) {
-                return err(409, "a job is already running");
+            if let Err(e) = job::start(job::Kind::Rename(from.clone(), to.clone())) {
+                return err(409, &e);
             }
             // a rewrite rule keeps the spelling when a match or a new file brings an old one back
             let mut st = Settings::load(c);
@@ -494,7 +506,7 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
         (Method::Post, ["api", "duplicates", "keep"]) => keep_copy(c, &s("dir")),
         (Method::Post, ["api", "trash", id, "restore"]) => match apply::restore(c, id.parse().unwrap_or(0)) {
             Ok(()) => {
-                job::start(job::Kind::Scan);
+                job::start(job::Kind::Scan).ok();
                 job::navidrome(&Settings::load(c));
                 ok(json!({"ok": true}))
             }
@@ -817,14 +829,13 @@ fn bulk(c: &Connection, body: &Value) -> Resp {
     match body["action"].as_str().unwrap_or_default() {
         "approve" => {
             set("approved");
-            ok(json!({ "ok": true, "applying": job::start(job::Kind::Apply) }))
+            ok(json!({ "ok": true, "applying": job::start(job::Kind::Apply).is_ok() }))
         }
         "reject" => {
             set("rejected");
             ok(json!({"ok": true}))
         }
-        "rematch" if job::start(job::Kind::Rematch(dirs)) => ok(json!({"ok": true})),
-        "rematch" => err(409, "a job is already running"),
+        "rematch" => started(job::start(job::Kind::Rematch(dirs))),
         _ => err(400, "unknown action"),
     }
 }
@@ -835,7 +846,7 @@ fn proposal_action(c: &Connection, id: &str, action: &str, body: &Value) -> Resp
         "approve" => {
             set_status("approved");
             // applies now, or with the next run if a job is busy
-            let started = job::start(job::Kind::Apply);
+            let started = job::start(job::Kind::Apply).is_ok();
             ok(json!({ "ok": true, "applying": started }))
         }
         "reject" => {

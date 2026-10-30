@@ -1,7 +1,8 @@
 # Network mounts (rclone, SMB, NFS)
 
-xmusic is built to be gentle on a library that lives on a network share. On a mount, opening a file costs a
-round trip, and after any write rclone uploads the whole file again.
+A local disk needs none of this page. If your library lives on a network share (NFS, SMB, or a cloud remote
+mounted with rclone), opening a file costs a round trip, and some mounts upload the whole file again after any
+write (rclone does). xmusic is built to be gentle on those.
 
 ## What xmusic does about it
 
@@ -18,7 +19,7 @@ is not keeping modification times stable.
 
 ## rclone mount flags
 
-Scans open thousands of files for a few KB of tags each. Flags worth testing:
+Only if you use rclone. Scans open thousands of files for a few KB of tags each. Flags worth testing:
 
 ```
 --vfs-cache-mode writes --buffer-size 0 --vfs-read-ahead 0

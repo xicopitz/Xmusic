@@ -130,18 +130,23 @@ pub fn render(c: &Connection) -> String {
     o.one("undo_log_entries", "gauge", "File changes that undo can still restore.", c.query_row("SELECT COUNT(*) FROM undo_log", [], |r| r.get(0)).unwrap());
 
     // jobs
-    let st = serde_json::to_value(job::status()).unwrap();
-    let running = st["running"].as_bool().unwrap_or(false);
-    o.one("job_running", "gauge", "1 while a job runs.", running as u8 as f64);
+    let jobs = job::status().jobs;
+    // one series per running job: `job` is its id, never a path
+    let id = |j: &job::JobStatus| vec![("kind", j.kind.clone()), ("job", j.id.to_string())];
+    o.one("job_running", "gauge", "Jobs running.", jobs.len() as f64);
     o.family(
         "job_info",
         "gauge",
-        "The running job's kind and phase (1 while running).",
-        running.then(|| (vec![("kind", st["kind"].as_str().unwrap_or_default().to_string()), ("phase", st["phase"].as_str().unwrap_or_default().to_string())], 1.0)),
+        "Each running job's kind and phase (1 while running).",
+        jobs.iter().map(|j| (vec![("kind", j.kind.clone()), ("job", j.id.to_string()), ("phase", j.phase.clone())], 1.0)),
     );
-    let (done, total) = (st["done"].as_f64().unwrap_or(0.0), st["total"].as_f64().unwrap_or(0.0));
-    o.one("job_progress_ratio", "gauge", "Progress of the current phase, 0..1.", if running && total > 0.0 { done / total } else { 0.0 });
-    o.one("job_eta_seconds", "gauge", "Estimated seconds until the running job finishes.", st["eta"].as_f64().unwrap_or(0.0));
+    o.family(
+        "job_progress_ratio",
+        "gauge",
+        "Progress of each running job's current phase, 0..1.",
+        jobs.iter().map(|j| (id(j), if j.total > 0 { j.done as f64 / j.total as f64 } else { 0.0 })),
+    );
+    o.family("job_eta_seconds", "gauge", "Estimated seconds until each running job finishes.", jobs.iter().map(|j| (id(j), j.eta)));
     o.family(
         "jobs_total",
         "counter",
@@ -197,6 +202,8 @@ fn renders() {
         r#"xmusic_last_job_duration_seconds{kind="scan"} 1"#,
         r#"xmusic_remote_requests_total{service="musicbrainz",result="rate_limited"} 1"#,
         "# TYPE xmusic_jobs_total counter",
+        "xmusic_job_running 0",
+        "# TYPE xmusic_job_eta_seconds gauge",
     ] {
         assert!(out.contains(want), "missing {want}\n{out}");
     }

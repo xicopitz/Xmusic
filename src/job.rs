@@ -1,19 +1,23 @@
-//! One background job at a time: scan → match → apply → cover art → lyrics → notify.
-//! Albums needing a human are parked as proposals; the job never waits for anyone.
+//! Background jobs, up to `max_jobs` at once: scan → match → apply → cover art → lyrics → notify.
+//! Albums needing a human are parked as proposals; a job never waits for anyone.
+//! Two jobs never write the same file at once (`apply::lock_file`), and identical jobs never overlap.
 
 use crate::db::{self, Settings};
 use crate::{apply, matcher, remote, scan};
 use chrono::Local;
 use rusqlite::params;
 use serde::Serialize;
+use std::cell::RefCell;
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-struct State {
-    running: bool,
+pub struct Job {
+    id: u64,
+    /// the Kind with its arguments: an identical job is refused while this one runs
+    key: String,
     kind: String,
     phase: String,
     done: u64,
@@ -22,19 +26,36 @@ struct State {
     started: i64,
     /// phases still to come: (name, items, seconds per item seed)
     upcoming: Vec<(&'static str, u64, f64)>,
-    last: Option<String>,
     /// seconds spent per finished phase ("scan: listing files" and "scan: reading tags" count as "scan")
     took: Vec<(String, f64)>,
+    cancel: AtomicBool,
 }
 
-static ST: LazyLock<Mutex<State>> = LazyLock::new(|| {
-    Mutex::new(State {
-        running: false, kind: String::new(), phase: String::new(), done: 0, total: 0,
-        phase_started: Instant::now(), started: 0, upcoming: vec![], last: None, took: vec![],
-    })
-});
+pub type Handle = Arc<Mutex<Job>>;
+
+static JOBS: Mutex<Vec<Handle>> = Mutex::new(vec![]);
+/// (job id, "label: summary") of the last jobs that ended, newest last: the dashboard toasts each one
+static ENDED: Mutex<Vec<(u64, String)>> = Mutex::new(vec![]);
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static WAKE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
-static CANCEL: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// the job this thread works for: its own thread, and the io pool's workers (`Settings::io_pool`)
+    static CUR: RefCell<Option<Handle>> = const { RefCell::new(None) };
+}
+
+pub fn current() -> Option<Handle> {
+    CUR.with(|c| c.borrow().clone())
+}
+
+pub fn enter(job: Option<Handle>) {
+    CUR.with(|c| *c.borrow_mut() = job);
+}
+
+/// Runs `f` on the current job, if this thread works for one (tests and web calls don't).
+fn with<T: Default>(f: impl FnOnce(&mut Job) -> T) -> T {
+    current().map(|j| f(&mut j.lock().unwrap())).unwrap_or_default()
+}
 /// Album folders the import hook announced while another job ran; imported when it ends.
 static PENDING_IMPORT: Mutex<std::collections::BTreeSet<String>> = Mutex::new(std::collections::BTreeSet::new());
 
@@ -50,7 +71,7 @@ fn start_pending() -> bool {
     if dirs.is_empty() {
         return false;
     }
-    if start(Kind::Import(dirs.clone())) {
+    if start(Kind::Import(dirs.clone())).is_ok() {
         return true;
     }
     PENDING_IMPORT.lock().unwrap().extend(dirs); // busy: keep them for the end of the running job
@@ -77,23 +98,24 @@ pub fn eta(done: u64, total: u64, elapsed: f64, seed: f64) -> f64 {
 }
 
 pub fn phase(name: &str, total: u64) {
-    let mut s = ST.lock().unwrap();
-    close_phase(&mut s);
-    s.phase = name.into();
-    s.done = 0;
-    s.total = total;
-    s.phase_started = Instant::now();
-    s.upcoming.retain(|(n, ..)| !name.starts_with(n));
+    with(|s| {
+        close_phase(s);
+        s.phase = name.into();
+        s.done = 0;
+        s.total = total;
+        s.phase_started = Instant::now();
+        s.upcoming.retain(|(n, ..)| !name.starts_with(n));
+    })
 }
 
 /// More items for the current phase (albums approved while it runs).
 pub fn grow(n: u64) {
-    ST.lock().unwrap().total += n;
+    with(|s| s.total += n)
 }
 
 /// Unwinds the job if it was cancelled. Call between files, never mid-write or mid-transaction.
 pub fn check() {
-    if CANCEL.load(Relaxed) {
+    if with(|s| s.cancel.load(Relaxed)) {
         std::panic::resume_unwind(Box::new(Cancelled));
     }
 }
@@ -101,19 +123,24 @@ pub fn check() {
 /// One item done (and a cancel point).
 pub fn tick() {
     check();
-    ST.lock().unwrap().done += 1;
+    with(|s| s.done += 1)
 }
 
-/// Ask the running job to stop after its current item; false if nothing runs.
-pub fn cancel() -> bool {
-    let running = running();
-    if running {
-        CANCEL.store(true, Relaxed);
+/// Ask a running job (None = all of them) to stop after its current item; false if none matched.
+pub fn cancel(id: Option<u64>) -> bool {
+    let jobs = JOBS.lock().unwrap();
+    let mut hit = false;
+    for j in jobs.iter() {
+        let j = j.lock().unwrap();
+        if id.is_none_or(|id| id == j.id) {
+            j.cancel.store(true, Relaxed);
+            hit = true;
+        }
     }
-    running
+    hit
 }
 
-fn close_phase(s: &mut State) {
+fn close_phase(s: &mut Job) {
     let name = s.phase.split(':').next().unwrap_or_default().to_string();
     if name.is_empty() || name == "starting" {
         return;
@@ -135,45 +162,75 @@ fn hms(secs: f64) -> String {
 }
 
 fn plan(upcoming: Vec<(&'static str, u64, f64)>) {
-    ST.lock().unwrap().upcoming = upcoming;
+    with(|s| s.upcoming = upcoming)
+}
+
+#[derive(Serialize)]
+pub struct JobStatus {
+    pub id: u64,
+    pub kind: String,
+    pub phase: String,
+    pub done: u64,
+    pub total: u64,
+    started: i64,
+    phase_eta: f64,
+    pub eta: f64,
+    upcoming: Vec<(&'static str, u64)>,
+    finished: Vec<(String, f64)>,
+    cancelling: bool,
 }
 
 #[derive(Serialize)]
 pub struct Status {
-    running: bool,
-    kind: String,
-    phase: String,
-    done: u64,
-    total: u64,
-    started: i64,
-    phase_eta: Option<f64>,
-    eta: Option<f64>,
-    upcoming: Vec<(&'static str, u64)>,
-    finished: Vec<(String, f64)>,
+    pub running: bool,
+    pub jobs: Vec<JobStatus>,
     last: Option<String>,
-    cancelling: bool,
+    ended: Vec<(u64, String)>,
 }
 
-pub fn status() -> Status {
-    let s = ST.lock().unwrap();
-    let phase_eta = s.running.then(|| eta(s.done, s.total, s.phase_started.elapsed().as_secs_f64(), seed(&s.phase)));
+fn job_status(s: &Job) -> JobStatus {
+    let phase_eta = eta(s.done, s.total, s.phase_started.elapsed().as_secs_f64(), seed(&s.phase));
     let rest: f64 = s.upcoming.iter().map(|(_, n, sec)| *n as f64 * sec).sum();
-    Status {
-        running: s.running,
+    JobStatus {
+        id: s.id,
         kind: s.kind.clone(),
         phase: s.phase.clone(),
         done: s.done,
         total: s.total,
         started: s.started,
         phase_eta,
-        eta: phase_eta.map(|p| p + rest),
+        eta: phase_eta + rest,
         upcoming: s.upcoming.iter().map(|(n, c, _)| (*n, *c)).collect(),
         finished: s.took.iter().filter(|(n, _)| !s.phase.starts_with(n.as_str())).cloned().collect(),
-        last: s.last.clone(),
-        cancelling: s.running && CANCEL.load(Relaxed),
+        cancelling: s.cancel.load(Relaxed),
     }
 }
 
+pub fn status() -> Status {
+    let jobs: Vec<JobStatus> = JOBS.lock().unwrap().iter().map(|j| job_status(&j.lock().unwrap())).collect();
+    let ended = ENDED.lock().unwrap().clone();
+    Status { running: !jobs.is_empty(), jobs, last: ended.last().map(|e| e.1.clone()), ended }
+}
+
+pub fn max_jobs() -> usize {
+    Settings::load(&db::open()).max_jobs.clamp(1, 8)
+}
+
+/// Why a job with this key can't start next to the running ones, if it can't.
+fn admit(running: &[String], key: &str, label: &str, max: usize) -> Result<(), String> {
+    if running.iter().any(|k| k == key) {
+        return Err(format!("{label} is already running"));
+    }
+    if running.len() >= max {
+        return Err(format!(
+            "Limit reached: {} of {max} jobs running. Wait for one to finish, or raise Max parallel jobs in Settings.",
+            running.len()
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
 pub enum Kind {
     Full,
     Apply,
@@ -195,18 +252,13 @@ pub enum Kind {
 }
 
 pub fn running() -> bool {
-    ST.lock().unwrap().running
+    !JOBS.lock().unwrap().is_empty()
 }
 
-/// Starts the job in the background; false if one is already running.
-pub fn start(kind: Kind) -> bool {
-    {
-        let mut s = ST.lock().unwrap();
-        if s.running {
-            return false;
-        }
-        s.running = true;
-        s.kind = match &kind {
+/// Starts the job in the background; Err says why not (full, or the same job already runs).
+pub fn start(kind: Kind) -> Result<(), String> {
+    let job: Handle = {
+        let label: String = match &kind {
             Kind::Full => "full run",
             Kind::Apply => "apply approved",
             Kind::Scan => "scan",
@@ -221,15 +273,22 @@ pub fn start(kind: Kind) -> bool {
             Kind::Undo(_) => "undo",
         }
         .into();
-        s.started = db::now();
-        s.phase = "starting".into();
-        s.upcoming.clear();
-        s.took.clear();
-        CANCEL.store(false, Relaxed);
-    }
+        let key = format!("{kind:?}");
+        let max = max_jobs();
+        let mut jobs = JOBS.lock().unwrap();
+        let keys: Vec<String> = jobs.iter().map(|j| j.lock().unwrap().key.clone()).collect();
+        admit(&keys, &key, &label, max)?;
+        let job = Arc::new(Mutex::new(Job {
+            id: NEXT_ID.fetch_add(1, Relaxed), key, kind: label, phase: "starting".into(), done: 0, total: 0,
+            phase_started: Instant::now(), started: db::now(), upcoming: vec![], took: vec![], cancel: AtomicBool::new(false),
+        }));
+        jobs.push(job.clone());
+        job
+    };
     std::thread::spawn(move || {
+        enter(Some(job.clone()));
         let started = db::now();
-        let label = ST.lock().unwrap().kind.clone();
+        let label = job.lock().unwrap().kind.clone();
         let settings = Settings::load(&db::open());
         let changed = || crate::metrics::FILES_WRITTEN.load(Relaxed) + crate::metrics::FILES_RESTORED.load(Relaxed);
         let before = changed();
@@ -243,7 +302,7 @@ pub fn start(kind: Kind) -> bool {
             Err(e) => format!("failed: {}", e.downcast_ref::<String>().cloned().or(e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()),
         };
         {
-            let mut s = ST.lock().unwrap();
+            let mut s = job.lock().unwrap();
             close_phase(&mut s);
             if s.took.len() > 1 || s.took.first().is_some_and(|t| t.1 >= 60.0) {
                 summary += &format!(" · took {}", s.took.iter().map(|(n, t)| format!("{n} {}", hms(*t))).collect::<Vec<_>>().join(", "));
@@ -262,22 +321,24 @@ pub fn start(kind: Kind) -> bool {
             }
             notify(&settings, &format!("xmusic: {label} finished"), &msg, if review > 0 { "#review" } else { "#jobs" });
         }
+        JOBS.lock().unwrap().retain(|j| !Arc::ptr_eq(j, &job));
         {
-            let mut s = ST.lock().unwrap();
-            s.running = false;
-            s.phase.clear();
-            s.upcoming.clear();
-            s.last = Some(format!("{label}: {summary}"));
+            let mut ended = ENDED.lock().unwrap();
+            ended.push((job.lock().unwrap().id, format!("{label}: {summary}")));
+            let extra = ended.len().saturating_sub(10);
+            ended.drain(..extra);
         }
+        enter(None);
         // albums approved while another job ran (or after the album pass's last look) get applied now;
-        // only after a clean finish, so a failing apply can't restart itself forever
-        // imports announced meanwhile come first; their own end chains the apply
+        // only after a clean finish, so a failing apply can't restart itself forever.
+        // Imports announced meanwhile come first; their own end chains the apply. An Apply that is
+        // already running refuses the duplicate and picks the new approvals up itself.
         let waiting = "SELECT EXISTS(SELECT 1 FROM proposals WHERE status='approved' AND dir IN (SELECT dir FROM tracks))";
         if !start_pending() && res.is_ok() && c.query_row(waiting, [], |r| r.get::<_, bool>(0)).unwrap() {
-            start(Kind::Apply);
+            start(Kind::Apply).ok();
         }
     });
-    true
+    Ok(())
 }
 
 /// Tell Navidrome to rescan, if configured. Errors are only logged.
@@ -481,8 +542,8 @@ pub fn scheduler() {
         let wait = (next - Local::now()).to_std().unwrap_or_default();
         let (_g, to) = WAKE.1.wait_timeout(guard, wait).unwrap();
         if to.timed_out() {
-            if !start(Kind::Full) {
-                eprintln!("scheduled run skipped: a job is already running");
+            if let Err(e) = start(Kind::Full) {
+                eprintln!("scheduled run skipped: {e}");
             }
             std::thread::sleep(std::time::Duration::from_secs(1)); // don't re-fire the same slot on an early wakeup
         }
@@ -496,4 +557,15 @@ fn eta_math() {
     assert_eq!(eta(10, 10, 30.0, 2.0), 0.0);
     assert!(parse_cron("0 3 * * *").is_ok());
     assert!(parse_cron("nope").is_err());
+}
+
+#[test]
+fn admits() {
+    let running = vec![format!("{:?}", Kind::Full), format!("{:?}", Kind::Lyrics(Some(vec!["/m/A".into()])))];
+    let key = |k: Kind| format!("{k:?}");
+    assert!(admit(&running, &key(Kind::Full), "full run", 8).is_err_and(|e| e.contains("already running")));
+    assert!(admit(&running, &key(Kind::Lyrics(Some(vec!["/m/A".into()]))), "x", 8).is_err(), "the same album twice");
+    assert!(admit(&running, &key(Kind::Lyrics(Some(vec!["/m/B".into()]))), "x", 8).is_ok(), "another album");
+    assert!(admit(&running, &key(Kind::Scan), "scan", 2).is_err_and(|e| e.contains("2 of 2")));
+    assert!(admit(&[], &key(Kind::Scan), "scan", 1).is_ok());
 }

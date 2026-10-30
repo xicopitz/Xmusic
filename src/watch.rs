@@ -74,7 +74,7 @@ pub fn run() {
             if dirty.is_some_and(|t| t.elapsed() >= QUIET) {
                 let kind = if s.watch_full_run { job::Kind::Full } else { job::Kind::Scan };
                 // busy: stay dirty and retry on the next tick
-                if job::start(kind) {
+                if job::start(kind).is_ok() {
                     dirty = None;
                 }
             }

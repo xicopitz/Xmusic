@@ -103,7 +103,10 @@ pub fn run_in(c: &mut Connection, only: Option<&[String]>) -> usize {
         changed
             .par_iter()
             .filter_map(|(lib, p, ms)| {
-                let r = tags::read(p);
+                let r = {
+                    let _busy = crate::apply::lock_file(&p.to_string_lossy());
+                    tags::read(p)
+                };
                 job::tick();
                 match r {
                     Ok(info) => Some((*lib, p, *ms, info)),

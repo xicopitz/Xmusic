@@ -1,8 +1,23 @@
 # Jobs and automation
 
-Only one job runs at a time. The sidebar shows a badge next to **Jobs** while one runs, and the Overview gets a
-bar with the current phase, progress, an ETA and a **Cancel** button. On the Jobs page the run is drawn as steps
-(for a full run: scan → match → albums): done, current with its count, and still to come.
+The sidebar shows a badge next to **Jobs** while a job runs, and the Overview gets a bar for each job with its
+current phase, progress, an ETA and a **Cancel** button. On the Jobs page each run is drawn as steps (for a full
+run: scan → match → albums): done, current with its count, and still to come.
+
+## Parallel jobs
+
+**Settings → General → Max parallel jobs** (default 1) sets how many jobs run at once. With 1 they run one
+after another, as before. With 2 or more, a small job (an album's Fetch lyrics, a re-match, a Lidarr import)
+starts next to a long full run instead of answering "already running".
+
+- The same job never runs twice at once: a second full run, or Fetch lyrics twice for one album, is refused.
+  Fetch lyrics for two different albums is fine.
+- Two jobs never write one file at the same time. The second one waits for that file, then reads it again,
+  so the undo log stays right.
+- MusicBrainz stays at one request per second for all jobs together, so two matching jobs aren't faster
+  than one. Parallel jobs help most when they use different services (lyrics, covers) while a full run matches.
+- Each job uses up to **Parallel file operations** threads, so 2 jobs × 3 can do 6 file operations at once.
+- A refused start says why: the limit is reached, or the same job is already running.
 
 ![Jobs](img/jobs.png)
 
@@ -38,7 +53,7 @@ albums. A file that is being written is finished first, so nothing is left half 
 
 **Settings → General → Scan schedule** takes a standard five-field cron expression, evaluated in the
 container's time zone (`TZ`). `0 3 * * *` runs a full run every day at 03:00. Empty means no scheduled runs. A
-scheduled run is skipped if a job is already running.
+scheduled run is skipped if a full run is already running, or the parallel job limit is reached.
 
 ## Watch mode
 
@@ -68,7 +83,7 @@ What each Lidarr event does:
 - **Renames and deletes** start a normal scan.
 - **Test** just answers OK. Other events are ignored.
 
-If a job is already running, the import waits and starts when that job ends.
+If no job slot is free (see [Parallel jobs](#parallel-jobs)), the import waits and starts when a job ends.
 
 The token is the only login, so treat it (and a URL containing it) like a password. Without a token the hook is off. Paths
 must be the same in both containers (both mount the music at `/music`, for example).

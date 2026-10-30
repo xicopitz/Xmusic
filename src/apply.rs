@@ -4,11 +4,34 @@ use crate::db::{self, Settings, Track};
 use crate::{job, matcher, remote, scan, tags};
 use rayon::prelude::*;
 use rusqlite::{Connection, params};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::{Condvar, Mutex};
 
 fn written() {
     crate::metrics::FILES_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+static BUSY: (Mutex<BTreeSet<String>>, Condvar) = (Mutex::new(BTreeSet::new()), Condvar::new());
+
+pub struct FileLock(String);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        BUSY.0.lock().unwrap().remove(&self.0);
+        BUSY.1.notify_all();
+    }
+}
+
+/// Held around every music-file write and scan read, so parallel jobs never touch one file at once.
+/// Hold one at a time and never wait for anything while holding it: then it can't deadlock.
+pub fn lock_file(path: &str) -> FileLock {
+    let mut busy = BUSY.0.lock().unwrap();
+    while busy.contains(path) {
+        busy = BUSY.1.wait(busy).unwrap();
+    }
+    busy.insert(path.to_string());
+    FileLock(path.to_string())
 }
 
 /// The one write path: `set` fields and, if given, the front cover (added, or replacing the current
@@ -21,6 +44,7 @@ pub fn write_with_undo(c: &Connection, t: &Track, set: &BTreeMap<String, String>
     let changes: Vec<_> = set.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
     let mut after = tags::Fields::new();
     let mut logged = None;
+    let _busy = lock_file(&t.path);
     let res = tags::write(Path::new(&t.path), &changes, cover, |fields, old_cover| {
         if cover.is_none() && set.iter().all(|(k, v)| fields.get(k) == Some(v)) {
             return Ok(false); // already what we'd write: no write, no upload
@@ -390,7 +414,10 @@ pub fn undo(dir: Option<&str>) -> usize {
         let changes: Vec<_> = old.into_iter().collect();
         // a replaced cover goes back; an added one is removed (empty bytes)
         let cover = old_cover.as_deref().or(added_cover.then_some(&[][..]));
-        match tags::write(Path::new(&path), &changes, cover, |_, _| Ok(true)) {
+        let busy = lock_file(&path);
+        let wrote = tags::write(Path::new(&path), &changes, cover, |_, _| Ok(true));
+        drop(busy);
+        match wrote {
             Ok(_) => {
                 c.execute("DELETE FROM undo_log WHERE id=?1", [id]).unwrap();
                 scan::refresh(&c, std::slice::from_ref(&path));
