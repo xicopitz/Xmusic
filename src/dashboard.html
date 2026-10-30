@@ -11,7 +11,12 @@
 <style>
 /* upcoming job steps: base-300 vanishes on a dark card, so mix from the text colour */
 #job-card .step:not(.step-primary)::before, #job-card .step:not(.step-primary)::after { --step-bg: color-mix(in oklab, var(--color-base-content) 30%, var(--color-base-100)); --step-fg: var(--color-base-content); }
-#job-card .step-now::after { box-shadow: 0 0 0 4px color-mix(in oklab, var(--color-primary) 35%, transparent); }
+#job-card .step-now::after { box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-primary) 35%, transparent); }
+/* compact job rows: small step dots, a thin line, faint dividers */
+#job-card .step { min-height: 2.75rem; font-size: .7rem; }
+#job-card .step::after { width: 1.25rem; height: 1.25rem; font-size: .6rem; }
+#job-card .step::before { height: .25rem; }
+#job-card .job-row + .job-row { border-top: 1px solid color-mix(in oklab, var(--color-base-content) 12%, transparent); }
 </style>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -102,7 +107,7 @@ async function api(method, path, body) {
   const r = await fetch(path, { method, headers: body !== undefined ? { 'Content-Type': 'application/json' } : {}, body: body !== undefined ? JSON.stringify(body) : undefined });
   const data = await r.json().catch(() => ({}));
   if (r.status === 401 && !path.startsWith('/api/login')) { showAuth(); throw new Error('login required') }
-  if (!r.ok) throw new Error(data.error || r.statusText);
+  if (!r.ok) throw Object.assign(new Error(data.error || r.statusText), { status: r.status });
   return data;
 }
 const post = (p, b = {}) => api('POST', p, b);
@@ -114,7 +119,7 @@ function toast(msg, kind = 'success') {
   $('#toasts').append(el);
   setTimeout(() => el.remove(), 5000);
 }
-const guard = fn => async (...a) => { try { await fn(...a) } catch (e) { if (e.message !== 'login required') toast(e.message, 'error') } };
+const guard = fn => async (...a) => { try { await fn(...a) } catch (e) { if (e.message !== 'login required') toast(e.message, e.status === 409 ? 'warning' : 'error') } };
 
 /* ---------- auth ---------- */
 async function showAuth() {
@@ -865,35 +870,48 @@ async function browseFolders(start, onPick) {
 }
 
 /* ---------- job polling ---------- */
-let LAST_JOB = null;
+let LAST_JOB = null, ENDED_SEEN = null;
 function renderJob(st) {
   const el = $('#job-card');
   if (!el || !st) return;
   if (!st.running) {
-    el.innerHTML = `<div class="alert"><span>No job running.${st.last ? ` Last: ${esc(st.last)}` : ''}</span></div>`;
+    el.innerHTML = `<div class="alert"><span>No job running (up to ${st.max} at once).${st.last ? ` Last: ${esc(st.last)}` : ''}</span></div>`;
     return;
   }
-  el.innerHTML = `<div class="flex flex-col gap-4">${st.jobs.map(jobCard).join('')}</div>`;
+  const full = st.jobs.length >= st.max;
+  el.innerHTML = card(`<span class="badge ${full ? 'badge-warning' : 'badge-info'}">${jobsCount(st)}</span>
+      ${full ? '<span class="text-xs font-normal opacity-70">Limit reached: new jobs are refused until one finishes.</span>' : ''}`,
+    `<div>${st.jobs.map(jobRow).join('')}</div>`);
 }
-function jobCard(j) {
+const jobsCount = st => `${st.jobs.length} of ${st.max} job${st.max > 1 ? 's' : ''} running`;
+// one compact row per job; the step chain only for jobs with several phases (full run, import)
+function jobRow(j) {
   const p = j.total ? pct(j.done, j.total) : null;
-  return card(`Running: ${esc(j.kind)}`, `
-    <div>${cancelBtn(j, 'btn-sm btn-error btn-outline', 'Cancel job')}</div>
-    <div class="flex justify-between text-sm"><span>Phase: <b>${esc(j.phase)}</b> ${j.total ? `(${j.done.toLocaleString()} / ${j.total.toLocaleString()})` : ''}</span><span>started ${when(j.started)}</span></div>
-    ${p === null ? '<progress class="progress progress-primary w-full"></progress>' : `<progress class="progress progress-primary w-full" value="${p}" max="100"></progress>`}
-    <div class="stats stats-horizontal">
-      <div class="stat p-3"><div class="stat-title">This phase</div><div class="stat-value text-2xl">${j.phase_eta != null ? '~' + dur(j.phase_eta) : '—'}</div></div>
-      <div class="stat p-3"><div class="stat-title">Whole run (estimate)</div><div class="stat-value text-2xl">${j.eta != null ? '~' + dur(j.eta) : '—'}</div><div class="stat-desc">done ≈ ${j.eta != null ? new Date(Date.now() + j.eta * 1000).toLocaleTimeString() : '—'}</div></div>
+  const eta = j.eta >= 1 ? `~${dur(j.eta)} left · done ≈ ${new Date(Date.now() + j.eta * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : '';
+  const steps = j.finished.length || j.upcoming.length;
+  return `<div class="job-row py-3 first:pt-0 last:pb-0 flex flex-col gap-1.5">
+    <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+      <span class="font-semibold">${esc(j.kind)}</span>
+      <span class="opacity-70">${esc(j.phase)}${j.total ? ` · ${j.done.toLocaleString()} / ${j.total.toLocaleString()}` : ''}</span>
+      <span class="grow"></span>
+      <span class="text-xs opacity-70">${eta || `started ${new Date(j.started * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`}</span>
+      ${cancelBtn(j, 'btn-xs btn-error btn-outline')}
     </div>
-    <ul class="steps steps-vertical sm:steps-horizontal text-xs w-full">${j.finished.map(([n, t]) => `<li class="step step-primary" data-content="✓">${esc(n)} · ${dur(t)}</li>`).join('')}<li class="step step-primary step-now font-semibold" data-content="●">${esc(j.phase)}${j.total ? ` (${j.done.toLocaleString()} / ${j.total.toLocaleString()})` : ''}</li>${j.upcoming.map(([n, c]) => `<li class="step">${esc(n)}${c ? ` (${c.toLocaleString()})` : ''}</li>`).join('')}</ul>`);
+    ${p === null ? '<progress class="progress progress-primary w-full h-1.5"></progress>' : `<progress class="progress progress-primary w-full h-1.5" value="${p}" max="100"></progress>`}
+    ${steps ? `<ul class="steps steps-horizontal text-xs w-full">${j.finished.map(([n, t]) => `<li class="step step-primary" data-content="✓">${esc(n)} · ${dur(t)}</li>`).join('')}<li class="step step-primary step-now font-semibold" data-content="●">${esc(j.phase)}</li>${j.upcoming.map(([n, c]) => `<li class="step">${esc(n)}${c ? ` (${c.toLocaleString()})` : ''}</li>`).join('')}</ul>` : ''}
+  </div>`;
 }
 async function poll() {
   let st;
   try { st = await api('GET', '/api/job') } catch { return }
   $('#tasks-dot').classList.toggle('hidden', !st.running);
-  // a job ended: one we saw last time is gone
-  if (LAST_JOB?.jobs.some(j => !st.jobs.some(n => n.id === j.id))) {
-    toast(st.last || 'Job finished', 'info'); route(); refreshBanner(); loadRecent();
+  // one toast per job that ended since the last poll, even one that started and ended between two polls;
+  // the first poll only notes where the list is, so a reload doesn't replay old endings
+  const fresh = ENDED_SEEN === null ? [] : st.ended.filter(([id]) => id > ENDED_SEEN);
+  ENDED_SEEN = Math.max(ENDED_SEEN ?? 0, ...st.ended.map(([id]) => id));
+  if (fresh.length) {
+    fresh.forEach(([, msg]) => toast(msg, msg.includes(': failed') ? 'error' : 'info'));
+    route(); refreshBanner(); loadRecent();
     if (REMATCH_DIR) { const dir = REMATCH_DIR; REMATCH_DIR = null; showProposalFor(dir) }
   }
   LAST_JOB = st;
@@ -905,10 +923,10 @@ async function poll() {
 // running-job indicators outside the Jobs page: sidebar badge + a bar on top of Overview
 function renderRunbar() {
   const jobs = LAST_JOB?.jobs || [], j = jobs[0], p = j?.total ? pct(j.done, j.total) : null;
-  $('#nav-jobs').textContent = (p === null ? 'running' : p + '%') + (jobs.length > 1 ? ` +${jobs.length - 1}` : '');
+  $('#nav-jobs').textContent = jobs.length > 1 ? `${jobs.length} running` : p === null ? 'running' : p + '%';
   $('#nav-jobs').classList.toggle('hidden', !j);
   const on = j && (location.hash.slice(1) || 'overview') === 'overview';
-  $('#runbar').innerHTML = on ? `<div class="alert alert-info flex flex-col items-stretch">${jobs.map(j => {
+  $('#runbar').innerHTML = on ? `<div class="alert alert-info flex flex-col items-stretch">${jobs.length > 1 ? `<div class="font-semibold text-sm">${jobsCount(LAST_JOB)}</div>` : ''}${jobs.map(j => {
       const p = j.total ? pct(j.done, j.total) : null;
       return `<div class="flex flex-wrap items-center gap-3">
         <span class="loading loading-spinner loading-sm"></span>
@@ -939,7 +957,7 @@ function renderTasks() {
   const st = LAST_JOB, el = $('#tasks-body');
   if (!el || !st) return;
   el.innerHTML = `
-    <h3 class="font-semibold text-sm">Running</h3>
+    <h3 class="font-semibold text-sm">Running <span class="font-normal opacity-70">(${jobsCount(st)})</span></h3>
     ${st.jobs.map(j => {
       const p = j.total ? pct(j.done, j.total) : null;
       return `<div class="flex flex-col gap-1">

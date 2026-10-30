@@ -369,7 +369,11 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
             "snapshots": rows(c, "SELECT * FROM (SELECT * FROM stats_snapshots ORDER BY ts DESC LIMIT 60) ORDER BY ts", []),
             "jobs": rows(c, "SELECT * FROM jobs ORDER BY id DESC LIMIT 30", []),
         })),
-        (Method::Get, ["api", "job"]) => ok(serde_json::to_value(job::status()).unwrap()),
+        (Method::Get, ["api", "job"]) => {
+            let mut st = serde_json::to_value(job::status()).unwrap();
+            st["max"] = json!(job::max_jobs());
+            ok(st)
+        }
         (Method::Post, ["api", "job", "cancel"]) => if job::cancel(body["id"].as_u64()) { ok(json!({"ok": true})) } else { err(409, "no such job is running") },
         (Method::Post, ["api", "run"]) => {
             let kind = match s("kind").as_str() {

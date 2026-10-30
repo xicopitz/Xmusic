@@ -34,7 +34,8 @@ pub struct Job {
 pub type Handle = Arc<Mutex<Job>>;
 
 static JOBS: Mutex<Vec<Handle>> = Mutex::new(vec![]);
-static LAST: Mutex<Option<String>> = Mutex::new(None);
+/// (job id, "label: summary") of the last jobs that ended, newest last: the dashboard toasts each one
+static ENDED: Mutex<Vec<(u64, String)>> = Mutex::new(vec![]);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static WAKE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
@@ -184,6 +185,7 @@ pub struct Status {
     pub running: bool,
     pub jobs: Vec<JobStatus>,
     last: Option<String>,
+    ended: Vec<(u64, String)>,
 }
 
 fn job_status(s: &Job) -> JobStatus {
@@ -206,10 +208,11 @@ fn job_status(s: &Job) -> JobStatus {
 
 pub fn status() -> Status {
     let jobs: Vec<JobStatus> = JOBS.lock().unwrap().iter().map(|j| job_status(&j.lock().unwrap())).collect();
-    Status { running: !jobs.is_empty(), jobs, last: LAST.lock().unwrap().clone() }
+    let ended = ENDED.lock().unwrap().clone();
+    Status { running: !jobs.is_empty(), jobs, last: ended.last().map(|e| e.1.clone()), ended }
 }
 
-fn max_jobs() -> usize {
+pub fn max_jobs() -> usize {
     Settings::load(&db::open()).max_jobs.clamp(1, 8)
 }
 
@@ -219,7 +222,10 @@ fn admit(running: &[String], key: &str, label: &str, max: usize) -> Result<(), S
         return Err(format!("{label} is already running"));
     }
     if running.len() >= max {
-        return Err(format!("{} job(s) already running (Settings → Max parallel jobs)", running.len()));
+        return Err(format!(
+            "Limit reached: {} of {max} jobs running. Wait for one to finish, or raise Max parallel jobs in Settings.",
+            running.len()
+        ));
     }
     Ok(())
 }
@@ -316,7 +322,12 @@ pub fn start(kind: Kind) -> Result<(), String> {
             notify(&settings, &format!("xmusic: {label} finished"), &msg, if review > 0 { "#review" } else { "#jobs" });
         }
         JOBS.lock().unwrap().retain(|j| !Arc::ptr_eq(j, &job));
-        *LAST.lock().unwrap() = Some(format!("{label}: {summary}"));
+        {
+            let mut ended = ENDED.lock().unwrap();
+            ended.push((job.lock().unwrap().id, format!("{label}: {summary}")));
+            let extra = ended.len().saturating_sub(10);
+            ended.drain(..extra);
+        }
         enter(None);
         // albums approved while another job ran (or after the album pass's last look) get applied now;
         // only after a clean finish, so a failing apply can't restart itself forever.
@@ -555,6 +566,6 @@ fn admits() {
     assert!(admit(&running, &key(Kind::Full), "full run", 8).is_err_and(|e| e.contains("already running")));
     assert!(admit(&running, &key(Kind::Lyrics(Some(vec!["/m/A".into()]))), "x", 8).is_err(), "the same album twice");
     assert!(admit(&running, &key(Kind::Lyrics(Some(vec!["/m/B".into()]))), "x", 8).is_ok(), "another album");
-    assert!(admit(&running, &key(Kind::Scan), "scan", 2).is_err_and(|e| e.contains("Max parallel")));
+    assert!(admit(&running, &key(Kind::Scan), "scan", 2).is_err_and(|e| e.contains("2 of 2")));
     assert!(admit(&[], &key(Kind::Scan), "scan", 1).is_ok());
 }
