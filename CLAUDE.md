@@ -20,6 +20,7 @@ Self-hosted music metadata fixer: a Rust binary that serves a web dashboard (dai
 - `job.rs`: the single background job, phases, progress/ETA, cron scheduler, notifications (linking to `public_url`), and the Navidrome rescan after any job that changed files.
 - `watch.rs`: watch mode. inotify on enabled libraries, 30 s debounce, then a scan or full run. `watch::reload()` after any library/settings change.
 - `metrics.rs`: Prometheus text exposition for `GET /metrics`. Gauges are read from SQLite at scrape time, plus in-memory counters (`remote()`, `FILES_WRITTEN`, `FILES_RESTORED`).
+- `health.rs`: the library health report (`GET /api/health`), computed from the tracks table only.
 - `web.rs`: tiny_http routes and the JSON API, including the library browser, album detail, cover serving and duplicate finder.
 - `dashboard.html`: the whole UI (vanilla JS). `assets/` holds pinned daisyUI, Tailwind browser and Chart.js, compiled into the binary.
 
@@ -34,7 +35,8 @@ Self-hosted music metadata fixer: a Rust binary that serves a web dashboard (dai
 - An album is the set of tracks in one directory (`tracks.dir`), where a disc subfolder counts as its parent's directory. Compute it only with `scan::album_dir`.
 - Full runs only match albums where no track has a release id (`job::NEEDS_MATCH`); an unaligned bonus track must not re-queue an applied album. A re-match (`job::Kind::Rematch`) also scores the album's own release (`matcher::match_album` picks up `MUSICBRAINZ_ALBUMID`), always lands in Review, never auto-applies, and is marked applied when nothing differs.
 - A cover.jpg/folder.jpg in the album folder (`scan::COVER_FILES`, recorded per album in `cover_files` by each scan) counts as a cover: such albums aren't embedded or reported as missing one. Use `db::HAS_COVER` in SQL.
-- Cover upgrades only replace a cover with a bigger one, and log the old picture bytes (`undo_log.old_cover`) so undo restores it.
+- Cover upgrades only replace a cover with a bigger one, and shrinking (`cover_shrink_above`) only with a smaller one. Both log the old picture bytes (`undo_log.old_cover`) so undo restores it.
+- Secret settings (`Settings::SECRETS`) never reach the browser: `GET /api/settings` sends `Settings::masked()`, and `PUT` restores masked values with `unmask`. A new secret goes in that list.
 - Schema changes go in `db::migrate`, keyed on `PRAGMA user_version`. Never edit `SCHEMA` for an existing table.
 - xmusic never deletes music files. "Keep this copy" in the duplicate finder moves the other copies with `apply::trash` to `<library>/.xmusic-trash/` (same relative path, logged in the `trash` table). `apply::restore` moves them back. Scans skip that folder, and emptying it is left to the user.
 - Duplicate groups include the disc set in their key, so `Disc 1 X` and `Disc 2 X` folders are halves of one album, not copies.

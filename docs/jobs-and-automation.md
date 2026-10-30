@@ -14,6 +14,7 @@ bar with the current phase, progress, an ETA and a **Cancel** button.
 | **Apply approved** | Writes approved proposals, with covers and lyrics for those albums |
 | **Fetch covers** | Only the cover part of the album pass |
 | **Fetch lyrics** | Only the lyrics part of the album pass |
+| **Rename artist** | Started from **Library → Health → Artist spellings**: writes the chosen spelling to the tracks that have another one |
 | **Apply custom tags & rewrites** | Applies your [rules](matching-and-review.md#rewrite-rules-and-custom-tags) everywhere |
 | **Undo all changes** | Restores the original tags from the undo log |
 

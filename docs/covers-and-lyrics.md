@@ -14,6 +14,10 @@ album needs a release id first.
 - **Replace smaller covers** (`cover_upgrade_below`, default 500): an embedded cover whose shorter side is below
   this many pixels is replaced, but only by a bigger one. The old picture is stored in the undo log, so undo
   restores it. `0` disables upgrades.
+- **Shrink larger covers** (`cover_shrink_above`, default 0 = off): an embedded cover whose shorter side is above
+  this many pixels (a 3000 px scan, say) is replaced by the Cover Art Archive one at **Cover size**, if that is
+  smaller. The album needs a release id. Undo restores the original. Only the front cover is touched; other
+  embedded pictures (back, booklet) stay.
 - **Save cover.jpg** (`cover_save_file`) also writes the fetched cover next to the tracks.
 
 ### Cover files next to the music

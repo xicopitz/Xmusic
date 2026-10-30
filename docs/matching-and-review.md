@@ -57,9 +57,15 @@ applied.
 
 ## Which tags are written
 
-Only the fields in **Write fields** (default `TITLE, ARTIST, ALBUM, ALBUMARTIST, DATE, TRACKNUMBER, TRACKTOTAL,
-DISCNUMBER, DISCTOTAL, GENRE, MUSICBRAINZ_*`) are changed, and fields in **Preserve fields** (`COMMENT`,
+Only the fields in **Write fields** (default `TITLE, ARTIST, ALBUM, ALBUMARTIST, DATE, ORIGINALDATE, TRACKNUMBER,
+TRACKTOTAL, DISCNUMBER, DISCTOTAL, GENRE, LABEL, CATALOGNUMBER, MUSICBRAINZ_*`) are changed, and fields in **Preserve fields** (`COMMENT`,
 `REPLAYGAIN_*`) are never overwritten. Patterns end in `*`.
+
+- `GENRE` is the release's most voted MusicBrainz genre, or its release group's when the release has none.
+- `ORIGINALDATE` is the release group's first release date; `DATE` is this release's date.
+- `LABEL` and `CATALOGNUMBER` come from the release's first label entry.
+
+Albums applied before these fields existed get them with a **Re-match**.
 
 ### Rewrite rules and custom tags
 

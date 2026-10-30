@@ -214,6 +214,7 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
         (Method::Post, ["api", "library"]) => ok(library(c, body)),
         (Method::Post, ["api", "library", "album"]) => ok(album(c, &s("dir"))),
         (Method::Get, ["api", "duplicates"]) => ok(duplicates(c)),
+        (Method::Get, ["api", "health"]) => ok(crate::health::report(c)),
         (Method::Get, ["api", "cover", id]) => cover(c, id),
         (Method::Get, ["api", "proposals"]) => {
             let status = query.split('&').find_map(|kv| kv.strip_prefix("status=")).unwrap_or("review");
@@ -231,9 +232,9 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
 
         // admin
         _ if admin_only => err(403, "admin only"),
-        (Method::Get, ["api", "settings"]) => ok(serde_json::to_value(Settings::load(c)).unwrap()),
+        (Method::Get, ["api", "settings"]) => ok(Settings::load(c).masked()),
         (Method::Put, ["api", "settings"]) => {
-            let new: Settings = match serde_json::from_value(body.clone()) {
+            let new: Settings = match serde_json::from_value(Settings::load(c).unmask(body.clone())) {
                 Ok(v) => v,
                 Err(e) => return err(400, &e.to_string()),
             };
@@ -257,12 +258,41 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
                 Err(e) => err(502, &e),
             }
         }
+        (Method::Post, ["api", "acoustid", "test"]) => {
+            let st = Settings::load(c);
+            let fpcalc = crate::remote::fpcalc_version();
+            let key = if st.acoustid_key.trim().is_empty() { Err("no key set".to_string()) } else { crate::remote::acoustid_check(&st.contact_email, st.acoustid_key.trim()) };
+            ok(json!({ "key_ok": key.is_ok(), "key": key.err(), "fpcalc": fpcalc }))
+        }
         (Method::Post, ["api", "navidrome", "test"]) => {
             let st = Settings::load(c);
             match crate::remote::navidrome_scan(&st.contact_email, &st.navidrome_url, &st.navidrome_user, &st.navidrome_password) {
                 Ok(()) => ok(json!({"ok": true})),
                 Err(e) => err(502, &e),
             }
+        }
+        (Method::Post, ["api", "health", "spelling"]) => {
+            let to = s("to");
+            let from: Vec<String> = body["from"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).filter(|v| *v != to).map(String::from).collect();
+            if to.trim().is_empty() || from.is_empty() {
+                return err(400, "pick a spelling and at least one other");
+            }
+            if !job::start(job::Kind::Rename(from.clone(), to.clone())) {
+                return err(409, "a job is already running");
+            }
+            // a rewrite rule keeps the spelling when a match or a new file brings an old one back
+            let mut st = Settings::load(c);
+            // drop earlier rules that renamed something *to* a spelling now being replaced, or the two would fight
+            st.rewrites.retain(|r| !(apply::ARTIST_FIELDS.contains(&r.field.as_str()) && from.iter().any(|f| f.replace('$', "$$") == r.replace)));
+            let pattern = format!("^(?:{})$", from.iter().map(|f| regex::escape(f)).collect::<Vec<_>>().join("|"));
+            for field in apply::ARTIST_FIELDS {
+                let rule = crate::db::Rewrite { field: field.into(), pattern: pattern.clone(), replace: to.replace('$', "$$") };
+                if !st.rewrites.iter().any(|r| r.field == rule.field && r.pattern == rule.pattern) {
+                    st.rewrites.push(rule);
+                }
+            }
+            st.save(c);
+            ok(json!({"ok": true}))
         }
         (Method::Post, ["api", "browse"]) => browse(&s("path")),
         (Method::Post, ["api", "duplicates", "keep"]) => keep_copy(c, &s("dir")),

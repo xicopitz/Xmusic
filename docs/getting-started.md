@@ -68,8 +68,9 @@ Subfolders `CD1/`, `Disc 2/` and similar are treated as part of their parent alb
    confident ones. It can take a while on a large library; the progress bar shows the phase and an ETA.
 2. Doubtful albums land in **Review**. See [Matching and review](matching-and-review.md).
 3. Set a contact e-mail in **Settings → General**. MusicBrainz asks for one in the User-Agent.
-4. Optional: an AcoustID key (free at [acoustid.org](https://acoustid.org)) lets xmusic identify files by
-   fingerprint when their tags are too poor to search.
+4. Optional: an AcoustID key (free at [acoustid.org](https://acoustid.org): register an *application*; the user
+   key on your profile is rejected) lets xmusic identify files by fingerprint when their tags are too poor to
+   search. **Settings → General → Test key** checks the key and `fpcalc`.
 
 ## Updating
 

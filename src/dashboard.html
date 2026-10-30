@@ -298,11 +298,11 @@ const pages = {
 
   async library(el) {
     const st = LIB;
-    const tabs = [['albums', 'Albums'], ['artists', 'Artists'], ['duplicates', 'Duplicates']];
+    const tabs = [['albums', 'Albums'], ['artists', 'Artists'], ['duplicates', 'Duplicates'], ['health', 'Health']];
     el.innerHTML = `
       <div class="flex flex-col sm:flex-row gap-2 sm:items-center mb-4">
         <div role="tablist" class="tabs tabs-box w-fit">${tabs.map(([k, l]) => `<a role="tab" class="tab ${k === st.view ? 'tab-active' : ''}" data-lview="${k}">${l}</a>`).join('')}</div>
-        ${st.view !== 'duplicates' ? `<label class="input sm:ml-auto w-full sm:w-72"><span aria-hidden="true">🔎</span><input type="search" id="lib-q" placeholder="Search album, artist, title…" value="${esc(st.q)}"></label>` : ''}
+        ${st.view !== 'duplicates' && st.view !== 'health' ? `<label class="input sm:ml-auto w-full sm:w-72"><span aria-hidden="true">🔎</span><input type="search" id="lib-q" placeholder="Search album, artist, title…" value="${esc(st.q)}"></label>` : ''}
       </div>
       ${st.artist && st.view === 'albums' ? `<div class="mb-3"><span class="badge badge-lg gap-2">Artist: ${esc(st.artist)} <button id="lib-clear" aria-label="Clear artist filter">✕</button></span></div>` : ''}
       <div id="lib-body"></div>`;
@@ -410,7 +410,8 @@ const pages = {
         ${txt('match_threshold', 'Match threshold', 'Below this confidence an album goes to “Needs manual”.', 'number', 'step="0.01" min="0" max="1"')}
         ${txt('io_threads', 'Parallel file operations', 'How many files are read or written at once. Lower is lighter on the NUC and on a network mount (rclone, SMB).', 'number', 'min="1" max="16"')}
         ${txt('auto_apply_above', 'Auto-apply above', 'At or above this confidence changes are written without review. 0 = always review.', 'number', 'step="0.01" min="0" max="1"')}
-        ${txt('acoustid_key', 'AcoustID API key', 'Free key from acoustid.org; enables fingerprint matching for badly tagged files.')}
+        <div class="flex flex-col gap-2">${txt('acoustid_key', 'AcoustID API key', 'An <b>application</b> key (acoustid.org → Register an application), not the user key on your profile. Enables fingerprint matching for badly tagged files.', 'password', 'autocomplete="off"')}
+          <div class="flex flex-wrap items-center gap-2"><button class="btn btn-sm" id="acoustid-test">Test key</button><span id="acoustid-status" class="text-sm"></span></div></div>
         <div class="flex flex-col gap-2"><span class="text-sm font-medium">Watch mode</span>
           ${chk('watch_enabled', 'Scan automatically when files in a library change')}
           ${chk('watch_full_run', 'After changes, do a full run (match + apply) instead of a scan only')}
@@ -443,7 +444,8 @@ const pages = {
       <div data-pane="media" class="grid gap-4 md:grid-cols-2">
         <div class="flex flex-col gap-2"><h3 class="font-semibold">Cover art (Cover Art Archive)</h3>${chk('cover_embed', 'Embed front cover in albums without one (a cover.jpg in the folder counts as one)')}${chk('cover_save_file', 'Also save cover.jpg in the album folder')}
           <label class="form-control"><span class="label text-sm">Size</span><select class="select" data-k="cover_size">${['250', '500', '1200', 'original'].map(v => `<option ${s.cover_size === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
-          ${txt('cover_upgrade_below', 'Upgrade covers smaller than (px)', 'Embedded covers below this size are replaced when the Cover Art Archive has a bigger one. 0 = never. Undo restores the original.', 'number', 'min="0" step="50"')}</div>
+          ${txt('cover_upgrade_below', 'Upgrade covers smaller than (px)', 'Embedded covers below this size are replaced when the Cover Art Archive has a bigger one. 0 = never. Undo restores the original.', 'number', 'min="0" step="50"')}
+          ${txt('cover_shrink_above', 'Shrink covers larger than (px)', 'Embedded covers above this size are replaced by the Cover Art Archive one at the size above, when it is smaller. Saves space on huge scans. Needs a MusicBrainz id. 0 = never. Undo restores the original.', 'number', 'min="0" step="100"')}</div>
         <div class="flex flex-col gap-2"><h3 class="font-semibold">Lyrics (LRCLIB)</h3>${chk('lyrics_enabled', 'Download lyrics')}${chk('lyrics_prefer_synced', 'Prefer time-synced lyrics')}${chk('lyrics_embed', 'Embed in the LYRICS tag')}${chk('lyrics_save_lrc', 'Save a .lrc file next to the track')}</div>
       </div>
       <div data-pane="notify" class="grid gap-4 md:grid-cols-2">
@@ -480,6 +482,13 @@ const pages = {
       toast('Settings saved');
     });
     $('#notify-test', el).onclick = guard(async () => { await post('/api/notify/test'); toast('Test notification sent') });
+    $('#acoustid-test', el).onclick = guard(async () => {
+      const out = $('#acoustid-status', el);
+      out.innerHTML = '<span class="loading loading-spinner loading-xs"></span>';
+      const r = await post('/api/acoustid/test');
+      const badge = (ok, text) => `<span class="badge ${ok ? 'badge-success' : 'badge-error'}">${esc(text)}</span>`;
+      out.innerHTML = `${badge(r.key_ok, r.key_ok ? 'Key accepted' : r.key)} ${badge(r.fpcalc.Ok, r.fpcalc.Ok || r.fpcalc.Err)}<span class="text-xs opacity-70 ml-1">Uses the saved key.</span>`;
+    });
     $('#navidrome-test', el).onclick = guard(async () => { await post('/api/navidrome/test'); toast('Navidrome scan started') });
     $('#lib-browse', el).onclick = guard(() => browseFolders($('#lib-add [name=path]', el).value, path => {
       $('#lib-add [name=path]', el).value = path;
@@ -603,6 +612,7 @@ async function renderLib(append = false) {
   const body = $('#lib-body');
   if (!body) return;
   if (LIB.view === 'duplicates') return renderDupes(body);
+  if (LIB.view === 'health') return renderHealth(body);
   const list = await post('/api/library', { view: LIB.view, q: LIB.q, artist: LIB.artist, offset: LIB.offset });
   if (LIB.view === 'artists') {
     body.innerHTML = `<ul class="menu bg-base-100 rounded-box shadow-sm w-full">${list.map(a => `<li><a data-artist="${esc(a.artist ?? '')}" class="flex justify-between">
@@ -624,6 +634,40 @@ async function renderLib(append = false) {
   $('#lib-more').innerHTML = more ? '<button class="btn">Load more</button>' : '';
   $('#lib-more button')?.addEventListener('click', () => { LIB.offset += 60; renderLib(true) });
   $$('#lib-grid [data-dir]:not([data-bound])').forEach(b => { b.dataset.bound = 1; b.onclick = guard(() => openAlbum(b.dataset.dir)) });
+}
+
+// tag problems across the library; each section lists album folders that open the album view
+async function renderHealth(body) {
+  const h = await api('GET', '/api/health');
+  const rematch = d => `<button class="btn btn-xs ml-auto" data-rematch="${esc(d)}">Re-match</button>`;
+  const dirBtn = d => `<button class="link link-hover text-left break-all" data-dir="${esc(d)}">${shortDir(d)}</button>`;
+  const section = (title, help, list, row) => `<details class="collapse collapse-arrow bg-base-100 shadow-sm">
+    <summary class="collapse-title font-semibold flex items-center gap-2">${title}<span class="badge ${list.total ? 'badge-warning' : 'badge-success'}">${list.total ? list.total.toLocaleString() : '✓'}</span></summary>
+    <div class="collapse-content"><p class="text-sm opacity-70 mb-2">${help}${list.total > list.items.length ? ` Showing the first ${list.items.length}.` : ''}</p>
+    <div class="flex flex-col">${list.items.map((x, i) => `<div class="flex flex-wrap gap-x-3 gap-y-1 items-baseline py-1 border-t border-base-300 text-sm">${row(x, i)}</div>`).join('')}</div></div></details>`;
+  body.innerHTML = `<p class="text-sm opacity-70 mb-3">${h.albums.toLocaleString()} album folders checked, from the tags of the last scan.</p><div class="flex flex-col gap-3">
+    ${section('Missing track numbers', 'Tracks without a TRACKNUMBER tag. Re-match fills them from MusicBrainz (the result lands in Review).', h.missing_numbers,
+      x => `${dirBtn(x.dir)}<span class="opacity-70">${x.missing} of ${x.tracks} tracks</span>${rematch(x.dir)}`)}
+    ${section('Gaps in track numbers', 'Numbers missing between 1 and the last track (or TRACKTOTAL). Usually a file is missing, which only you can add; re-match fixes wrong numbers or totals.', h.gaps,
+      x => `${dirBtn(x.dir)}<span class="opacity-70">missing ${esc(x.missing)}</span>${rematch(x.dir)}`)}
+    ${section('Mixed album artists', 'Tracks in one album folder disagree on ALBUMARTIST, so players can split the album. Re-match sets one for all tracks.', h.album_artist,
+      x => `${dirBtn(x.dir)}${x.values.map(v => `<span class="badge badge-ghost">${esc(v)}</span>`).join('')}${x.without ? `<span class="opacity-70">${x.without} without</span>` : ''}${rematch(x.dir)}`)}
+    ${section('Artist spellings', `Names that only differ in case, accents, punctuation or a leading “The”.${ME.admin ? ' Press <b>Use</b> on the right one: the others are renamed in ARTIST and ALBUMARTIST, and a rewrite rule keeps it that way.' : ''}`, h.spellings,
+      (x, i) => x.map(n => `<span class="join"><button class="badge badge-ghost gap-1 join-item h-auto" data-artist="${esc(n.name)}">${esc(n.name)}<span class="opacity-60">${n.tracks}</span></button>${ME.admin ? `<button class="btn btn-xs btn-primary join-item" data-use="${i}" data-name="${esc(n.name)}">Use</button>` : ''}</span>`).join(''))}
+    ${section('Lossy files in FLAC albums', 'MP3, AAC or Ogg tracks in a folder that also holds FLAC: usually a stray download or a lower-quality copy.', h.lossy_in_flac,
+      x => `${dirBtn(x.dir)}${x.files.map(f => `<span class="text-xs"><span class="font-mono">${esc(f.path.split('/').pop())}</span> <span class="badge badge-xs">${esc(f.format)} ${f.bitrate} kbps</span></span>`).join('')}`)}
+  </div>`;
+  $$('[data-dir]', body).forEach(b => b.onclick = guard(() => openAlbum(b.dataset.dir)));
+  $$('[data-artist]', body).forEach(b => b.onclick = () => { LIB.artist = b.dataset.artist; LIB.view = 'albums'; LIB.offset = 0; route() });
+  $$('[data-rematch]', body).forEach(b => b.onclick = guard(async () => { await post('/api/rematch', { dir: b.dataset.rematch }); b.disabled = true; toast('Re-matching; the result lands in Review'); poll() }));
+  $$('[data-use]', body).forEach(b => b.onclick = guard(async () => {
+    const group = h.spellings.items[+b.dataset.use], to = b.dataset.name, from = group.filter(n => n.name !== to);
+    const n = from.reduce((a, x) => a + x.tracks, 0);
+    if (!confirm(`Rename ${from.map(x => `“${x.name}”`).join(', ')} to “${to}”? About ${n} tag value(s) change; undo restores them.`)) return;
+    await post('/api/health/spelling', { from: from.map(x => x.name), to });
+    $$(`[data-use="${b.dataset.use}"]`, body).forEach(x => x.disabled = true);
+    toast(`Renaming to ${to}`); poll();
+  }));
 }
 
 async function openAlbum(dir) {

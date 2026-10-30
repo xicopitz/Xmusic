@@ -89,7 +89,7 @@ pub fn search_releases(contact: &str, artist: &str, album: &str, tracks: usize) 
 }
 
 pub fn release(contact: &str, mbid: &str) -> Res<Value> {
-    mb_get(contact, &format!("release/{mbid}"), &[("inc", "recordings artist-credits release-groups genres")])
+    mb_get(contact, &format!("release/{mbid}"), &[("inc", "recordings artist-credits release-groups genres labels")])
 }
 
 /// Runs chromaprint's fpcalc → (duration secs, fingerprint). None if fpcalc is missing or fails.
@@ -100,18 +100,45 @@ pub fn fpcalc(path: &str) -> Option<(u64, String)> {
     Some((v["duration"].as_f64()? as u64, v["fingerprint"].as_str()?.to_string()))
 }
 
-/// AcoustID lookup → [(score, recording id, release ids)].
-pub fn acoustid(contact: &str, key: &str, dur: u64, fp: &str) -> Res<Vec<(f64, String, Vec<String>)>> {
+/// AcoustID's answer, or its error message (a 400 carries the reason: bad key, bad fingerprint).
+fn acoustid_lookup(contact: &str, key: &str, dur: u64, fp: &str) -> Res<Value> {
     std::thread::sleep(Duration::from_millis(340)); // 3 req/s limit
     let dur = dur.to_string();
     let sent = http(contact)
         .post("https://api.acoustid.org/v2/lookup")
-        .send_form([("client", key), ("duration", &dur), ("fingerprint", fp), ("meta", "recordings releaseids")]);
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send_form([("client", key.trim()), ("duration", &dur), ("fingerprint", fp), ("meta", "recordings releaseids")]);
     let v: Value = counted("acoustid", sent)
         .map_err(|e| format!("acoustid: {e}"))?
         .body_mut()
         .read_json()
         .map_err(|e| e.to_string())?;
+    if v["status"] != "ok" {
+        return Err(format!("acoustid: {}", v["error"]["message"].as_str().unwrap_or("unknown error")));
+    }
+    Ok(v)
+}
+
+/// Is the key accepted? Sends a dummy fingerprint: AcoustID checks the key first, so a good key gets
+/// "invalid fingerprint" back and a bad one "invalid API key".
+pub fn acoustid_check(contact: &str, key: &str) -> Res<()> {
+    match acoustid_lookup(contact, key, 1, "AQAA") {
+        Err(e) if !e.contains("fingerprint") => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// fpcalc's version line, or why it can't run.
+pub fn fpcalc_version() -> Result<String, String> {
+    let out = std::process::Command::new("fpcalc").arg("-version").output().map_err(|e| format!("fpcalc: {e}"))?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// AcoustID lookup → [(score, recording id, release ids)].
+pub fn acoustid(contact: &str, key: &str, dur: u64, fp: &str) -> Res<Vec<(f64, String, Vec<String>)>> {
+    let v = acoustid_lookup(contact, key, dur, fp)?;
     let mut out = vec![];
     for r in v["results"].as_array().into_iter().flatten() {
         let score = r["score"].as_f64().unwrap_or(0.0);

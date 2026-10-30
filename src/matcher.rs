@@ -37,6 +37,10 @@ pub struct Release {
     pub formats: Vec<String>,
     pub rg_id: String,
     pub genre: Option<String>,
+    pub label: String,
+    pub catalog: String,
+    /// first release date of the release group
+    pub original_date: String,
     pub tracks: Vec<RelTrack>,
 }
 
@@ -92,10 +96,10 @@ pub fn parse_release(v: &Value) -> Release {
             });
         }
     }
-    let genre = v["genres"]
-        .as_array()
-        .and_then(|g| g.iter().max_by_key(|x| x["count"].as_i64().unwrap_or(0)))
-        .map(|g| s(&g["name"]));
+    // most voted genre; releases rarely have their own, so fall back to the release group's
+    let top = |g: &Value| g.as_array().and_then(|g| g.iter().max_by_key(|x| x["count"].as_i64().unwrap_or(0))).map(|g| s(&g["name"]));
+    let genre = top(&v["genres"]).or_else(|| top(&v["release-group"]["genres"]));
+    let li = &v["label-info"][0];
     Release {
         id: s(&v["id"]),
         title: s(&v["title"]),
@@ -106,6 +110,9 @@ pub fn parse_release(v: &Value) -> Release {
         formats: media.iter().map(|m| s(&m["format"])).collect(),
         rg_id: s(&v["release-group"]["id"]),
         genre,
+        label: s(&li["label"]["name"]),
+        catalog: Some(s(&li["catalog-number"])).filter(|c| c != "[none]").unwrap_or_default(),
+        original_date: s(&v["release-group"]["first-release-date"]),
         tracks,
     }
 }
@@ -240,6 +247,9 @@ pub fn changes(local: &[Track], rel: &Release, assign: &[Option<usize>], s: &Set
             put("ALBUM", rel.title.clone());
             put("ALBUMARTIST", rel.artist.clone());
             put("DATE", rel.date.clone());
+            put("ORIGINALDATE", rel.original_date.clone());
+            put("LABEL", rel.label.clone());
+            put("CATALOGNUMBER", rel.catalog.clone());
             put("TRACKNUMBER", r.pos.to_string());
             put("TRACKTOTAL", r.track_total.to_string());
             put("DISCNUMBER", r.disc.to_string());
@@ -404,7 +414,8 @@ mod tests {
         Release {
             id: "rel1".into(), title: "Kind of Blue".into(), artist: "Miles Davis".into(), artist_id: "a1".into(),
             date: "1959-08-17".into(), country: "US".into(), formats: vec!["CD".into()], rg_id: "rg1".into(),
-            genre: Some("jazz".into()), tracks: vec![t(1, "So What", 562.0), t(2, "Freddie Freeloader", 586.0)],
+            genre: Some("jazz".into()), label: "Columbia".into(), catalog: "CL 1355".into(), original_date: "1959".into(),
+            tracks: vec![t(1, "So What", 562.0), t(2, "Freddie Freeloader", 586.0)],
         }
     }
 
@@ -421,6 +432,20 @@ mod tests {
         assert_eq!(ch[&10]["TITLE"], "Freddie Freeloader");
         assert!(!ch[&11].contains_key("TITLE"), "unchanged values are dropped");
         assert_eq!(ch[&11]["MUSICBRAINZ_ALBUMID"], "rel1");
+        assert_eq!(ch[&11]["LABEL"], "Columbia");
+        assert_eq!(ch[&11]["ORIGINALDATE"], "1959");
+    }
+
+    #[test]
+    fn parses_label_and_group_genre() {
+        let v = serde_json::json!({
+            "id": "r", "genres": [], "media": [],
+            "release-group": { "first-release-date": "1993", "genres": [{"name": "rock", "count": 1}, {"name": "glam metal", "count": 3}] },
+            "label-info": [{ "catalog-number": "[none]", "label": { "name": "Elektra" } }],
+        });
+        let r = parse_release(&v);
+        assert_eq!(r.genre.as_deref(), Some("glam metal"));
+        assert_eq!((r.label.as_str(), r.catalog.as_str(), r.original_date.as_str()), ("Elektra", "", "1993"));
     }
 
     #[test]

@@ -104,18 +104,18 @@ impl Pass {
     pub const LYRICS: Pass = Pass { tags: false, covers: false, lyrics: true };
 }
 
-/// Albums the write pass has work for: an approved proposal, a missing or small cover on a tagged
-/// album, or tracks without lyrics, each only if `p` asks for it.
+/// Albums the write pass has work for: an approved proposal, a missing, small or oversized cover on a
+/// tagged album, or tracks without lyrics, each only if `p` asks for it.
 pub fn album_dirs(c: &Connection, s: &Settings, p: Pass) -> Vec<String> {
     c.prepare(&format!(
         "SELECT DISTINCT dir FROM tracks WHERE (?5 AND dir IN (SELECT dir FROM proposals WHERE status='approved'))
-         OR (?1 AND (NOT {} OR (?2>0 AND cover_px>0 AND cover_px<?2)) AND json_extract(tags,'$.MUSICBRAINZ_ALBUMID') IS NOT NULL)
+         OR (?1 AND (NOT {} OR (?2>0 AND cover_px>0 AND cover_px<?2) OR (?6>0 AND cover_px>?6)) AND json_extract(tags,'$.MUSICBRAINZ_ALBUMID') IS NOT NULL)
          OR (?3 AND has_lyrics=0 AND (lyrics_miss IS NULL OR lyrics_miss<?4)
              AND json_extract(tags,'$.TITLE') IS NOT NULL AND json_extract(tags,'$.ARTIST') IS NOT NULL)",
         db::HAS_COVER
     ))
     .unwrap()
-    .query_map(params![s.cover_embed && p.covers, s.cover_upgrade_below, wants_lyrics(s) && p.lyrics, lyrics_retry(), p.tags], |r| r.get(0))
+    .query_map(params![s.cover_embed && p.covers, s.cover_upgrade_below, wants_lyrics(s) && p.lyrics, lyrics_retry(), p.tags, s.cover_shrink_above], |r| r.get(0))
     .unwrap()
     .map(Result::unwrap)
     .collect()
@@ -170,7 +170,8 @@ fn album(c: &Connection, dir: &str, s: &Settings, p: Pass) -> Done {
     let small = s.cover_upgrade_below;
     // a cover.jpg in the folder is a cover: players like Navidrome read it, and embedding would rewrite every file
     let cover_file: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM cover_files WHERE dir=?1)", [dir], |r| r.get(0)).unwrap();
-    let wants_cover = |t: &Track| (!t.has_cover && !cover_file) || (small > 0 && t.cover_px > 0 && t.cover_px < small);
+    let too_big = |t: &Track| s.cover_shrink_above > 0 && t.cover_px > s.cover_shrink_above;
+    let wants_cover = |t: &Track| (!t.has_cover && !cover_file) || (small > 0 && t.cover_px > 0 && t.cover_px < small) || too_big(t);
     let release = (0..tracks.len()).map(|i| eff(&sets, i, "MUSICBRAINZ_ALBUMID")).find(|r| !r.is_empty());
     // cancel points between files: on a network mount one album can take minutes. A half-written album
     // keeps its proposal approved; the next run finishes it (tracks already written are skipped).
@@ -228,8 +229,9 @@ fn album(c: &Connection, dir: &str, s: &Settings, p: Pass) -> Done {
     let mut errs = vec![];
     for (t, set) in tracks.iter().zip(&sets) {
         job::check();
-        // only a cover that adds one, or is bigger than a too-small one
-        let cv = cover.as_deref().filter(|_| wants_cover(t) && (!t.has_cover || new_px > t.cover_px));
+        // only a cover that adds one, is bigger than a too-small one, or smaller than an oversized one
+        let fits = !t.has_cover || if too_big(t) { new_px > 0 && new_px < t.cover_px } else { new_px > t.cover_px };
+        let cv = cover.as_deref().filter(|_| wants_cover(t) && fits);
         match write_with_undo(c, t, set, cv) {
             Ok(true) => {
                 d.files += 1;
@@ -263,6 +265,31 @@ pub fn rules_everywhere(s: &Settings) -> usize {
                 let mut new = BTreeMap::new();
                 matcher::apply_rules(t, &mut new, s, &rules);
                 let wrote = write_with_undo(c, t, &new, None).map_err(|e| eprintln!("{}: {e}", t.path)).unwrap_or(false);
+                job::tick();
+                wrote as usize
+            })
+            .sum()
+    })
+}
+
+pub const ARTIST_FIELDS: [&str; 2] = ["ARTIST", "ALBUMARTIST"];
+
+/// Set ARTIST / ALBUMARTIST to `to` on tracks where it is exactly one of `from`. Only those files are touched.
+pub fn rename_artist(s: &Settings, from: &[String], to: &str) -> usize {
+    let c = db::open();
+    let tracks = db::tracks_where(
+        &c,
+        "json_extract(tags,'$.ARTIST') IN (SELECT value FROM json_each(?1)) OR json_extract(tags,'$.ALBUMARTIST') IN (SELECT value FROM json_each(?1))",
+        [serde_json::to_string(from).unwrap()],
+    );
+    job::phase("rename artist", tracks.len() as u64);
+    s.io_pool().install(|| {
+        tracks
+            .par_iter()
+            .map_init(db::open, |c, t| {
+                let set: BTreeMap<String, String> =
+                    ARTIST_FIELDS.iter().filter(|k| t.tags.get(**k).is_some_and(|v| from.contains(v))).map(|k| (k.to_string(), to.to_string())).collect();
+                let wrote = write_with_undo(c, t, &set, None).map_err(|e| eprintln!("{}: {e}", t.path)).unwrap_or(false);
                 job::tick();
                 wrote as usize
             })

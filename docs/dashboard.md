@@ -16,7 +16,7 @@ formats and audio quality, and the review queue. The yellow banner appears whene
 
 ![Library](img/library.png)
 
-Three tabs: **Albums** (cover grid, with badges such as `untagged`), **Artists**, and **Duplicates**. The search
+Four tabs: **Albums** (cover grid, with badges such as `untagged`), **Artists**, **Duplicates** and **Health**. The search
 box matches album, artist and track titles.
 
 Opening an album shows its tracks with a lyrics badge for each, the cover size, a link to the MusicBrainz
@@ -28,6 +28,28 @@ An album with a `cover.jpg` or `folder.jpg` next to its tracks counts as having 
 *cover file* badge.
 
 Duplicates are covered in [Duplicates](duplicates.md).
+
+### Health
+
+A report built from the tags of the last scan (no file reads, no network), one section per problem:
+
+- **Missing track numbers**: tracks without `TRACKNUMBER`.
+- **Gaps in track numbers**: numbers missing between 1 and the last track (or `TRACKTOTAL`), per disc.
+- **Mixed album artists**: an album folder whose tracks disagree on `ALBUMARTIST`.
+- **Artist spellings**: names that differ only in case, accents, punctuation, `&`/`and` or a leading "The"
+  (`Mötley Crüe` / `Motley Crue`).
+- **Lossy files in FLAC albums**: MP3, AAC or Ogg tracks in a folder that also holds FLAC.
+
+Album folders open the album view; artist names open their albums.
+
+Fixing from the report:
+
+- **Use** next to a spelling (admins) renames the other spellings to it in `ARTIST` and `ALBUMARTIST`, as a job
+  that only writes the affected files (undo restores them). It also adds rewrite rules for both fields, so a
+  later match or a new file can't bring the old spelling back. Picking a different spelling later replaces those
+  rules.
+- **Re-match** on an album row (missing numbers, gaps, mixed album artists) matches it again; the result lands
+  in Review. A gap caused by a missing file needs the file.
 
 ## Review
 

@@ -1,6 +1,7 @@
 mod apply;
 mod auth;
 mod db;
+mod health;
 mod job;
 mod matcher;
 mod metrics;

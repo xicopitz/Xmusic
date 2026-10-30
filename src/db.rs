@@ -54,7 +54,7 @@ pub fn init(c: &Connection) {
 /// Schema changes after the first release, keyed on PRAGMA user_version.
 fn migrate(c: &Connection) {
     let version = |c: &Connection| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap();
-    const LATEST: i64 = 3;
+    const LATEST: i64 = 4;
     if version(c) >= LATEST {
         return;
     }
@@ -83,6 +83,17 @@ fn migrate(c: &Connection) {
              PRAGMA user_version=3;",
         )
         .expect("migration 3");
+    }
+    if version(c) < 4 {
+        // label, catalog number and original date are new defaults; add them to a saved write list
+        let mut s = Settings::load(c);
+        for k in ["LABEL", "CATALOGNUMBER", "ORIGINALDATE"] {
+            if !s.write_fields.iter().any(|f| f.eq_ignore_ascii_case(k)) {
+                s.write_fields.push(k.into());
+            }
+        }
+        s.save(c);
+        c.execute_batch("PRAGMA user_version=4;").expect("migration 4");
     }
     c.execute_batch("COMMIT").unwrap();
 }
@@ -150,6 +161,8 @@ pub struct Settings {
     pub cover_size: String,
     /// replace embedded covers whose shorter side is below this many px (0 = never)
     pub cover_upgrade_below: u32,
+    /// replace embedded covers whose shorter side is above this many px with the smaller CAA one (0 = never)
+    pub cover_shrink_above: u32,
     pub lyrics_enabled: bool,
     pub lyrics_prefer_synced: bool,
     pub lyrics_embed: bool,
@@ -182,7 +195,8 @@ impl Default for Settings {
             auto_apply_above: 0.95,
             acoustid_key: String::new(),
             contact_email: String::new(),
-            write_fields: ["TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "DATE", "TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL", "GENRE", "MUSICBRAINZ_*"]
+            write_fields: ["TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "DATE", "ORIGINALDATE", "TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL", "GENRE",
+                "LABEL", "CATALOGNUMBER", "MUSICBRAINZ_*"]
                 .map(String::from)
                 .to_vec(),
             preserve_fields: vec!["COMMENT".into(), "REPLAYGAIN_*".into()],
@@ -194,6 +208,7 @@ impl Default for Settings {
             cover_save_file: false,
             cover_size: "1200".into(),
             cover_upgrade_below: 500,
+            cover_shrink_above: 0,
             lyrics_enabled: true,
             lyrics_prefer_synced: true,
             lyrics_embed: true,
@@ -235,6 +250,32 @@ impl Settings {
             params![serde_json::to_string(self).unwrap()],
         )
         .unwrap();
+    }
+
+    /// Secret fields are never sent to the browser: it gets `MASK` when one is set, and sends `MASK`
+    /// back to keep the stored value.
+    pub const SECRETS: [&str; 3] = ["acoustid_key", "gotify_token", "navidrome_password"];
+    pub const MASK: &str = "••••••••";
+
+    pub fn masked(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).unwrap();
+        for k in Self::SECRETS {
+            if v[k] != "" {
+                v[k] = Self::MASK.into();
+            }
+        }
+        v
+    }
+
+    /// `new` as sent by the browser, with masked secrets taken from `self`.
+    pub fn unmask(&self, mut new: serde_json::Value) -> serde_json::Value {
+        let old = serde_json::to_value(self).unwrap();
+        for k in Self::SECRETS {
+            if new[k] == Self::MASK {
+                new[k] = old[k].clone();
+            }
+        }
+        new
     }
 
     /// Field may be written: matches write_fields and not preserve_fields (trailing `*` = prefix).
@@ -285,5 +326,6 @@ fn writable_globs() {
     assert!(s.writable("MUSICBRAINZ_ALBUMID"));
     assert!(!s.writable("COMMENT"));
     assert!(!s.writable("REPLAYGAIN_TRACK_GAIN"));
-    assert!(!s.writable("LABEL"));
+    assert!(s.writable("LABEL"));
+    assert!(!s.writable("MOOD"));
 }
