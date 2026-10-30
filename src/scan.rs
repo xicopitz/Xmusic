@@ -43,8 +43,14 @@ fn is_audio(p: &Path) -> bool {
 /// Cover files next to the music; `web::cover` serves them when a track has no embedded art.
 pub const COVER_FILES: [&str; 4] = ["cover.jpg", "folder.jpg", "cover.png", "folder.png"];
 
-/// Returns number of files (re)read.
+/// Every enabled library. Returns number of files (re)read.
 pub fn run(c: &mut Connection) -> usize {
+    run_in(c, None)
+}
+
+/// `only`: just these album folders (an import), which must lie inside an enabled library. Tracks and
+/// cover files are then pruned only under them, and the libraries' last scan time is left alone.
+pub fn run_in(c: &mut Connection, only: Option<&[String]>) -> usize {
     let libs: Vec<(i64, String)> = c
         .prepare("SELECT id,path FROM libraries WHERE enabled=1")
         .unwrap()
@@ -54,6 +60,15 @@ pub fn run(c: &mut Connection) -> usize {
         // an unmounted library must not wipe its tracks
         .filter(|(_, p): &(i64, String)| Path::new(p).is_dir())
         .collect();
+    // (library, folder to walk)
+    let roots: Vec<(i64, String)> = match only {
+        None => libs.clone(),
+        Some(dirs) => dirs
+            .iter()
+            .filter(|d| Path::new(d).is_dir())
+            .filter_map(|d| libs.iter().find(|(_, root)| Path::new(d).starts_with(root)).map(|(lib, _)| (*lib, d.trim_end_matches('/').to_string())))
+            .collect(),
+    };
     let known: HashMap<String, (i64, i64)> = c
         .prepare("SELECT path,COALESCE(mtime,-1),size FROM tracks") // NULL mtime = force a re-read
         .unwrap()
@@ -65,7 +80,7 @@ pub fn run(c: &mut Connection) -> usize {
     job::phase("scan: listing files", 0);
     let mut all: Vec<(i64, PathBuf, (i64, i64))> = Vec::new();
     let mut covers: HashSet<String> = HashSet::new();
-    for (lib, root) in &libs {
+    for (lib, root) in &roots {
         let walk = WalkDir::new(root).follow_links(true).into_iter().filter_entry(|e| e.file_name() != crate::apply::TRASH);
         for e in walk.filter_map(Result::ok) {
             crate::job::check(); // listing a big network mount takes minutes
@@ -126,8 +141,8 @@ pub fn run(c: &mut Connection) -> usize {
         for (_, p, _) in &all {
             seen.execute(params![scan_id, p.to_string_lossy()]).unwrap();
         }
-        // only prune inside libraries we actually walked
-        for (_, root) in &libs {
+        // only prune inside what we actually walked
+        for (_, root) in &roots {
             let root = root.trim_end_matches('/');
             tx.execute("DELETE FROM cover_files WHERE dir=?1 OR substr(dir,1,length(?1)+1)=?1||'/'", [root]).unwrap();
         }
@@ -135,9 +150,15 @@ pub fn run(c: &mut Connection) -> usize {
         for d in &covers {
             cov.execute([d]).unwrap();
         }
-        for (lib, _) in &libs {
-            tx.execute("DELETE FROM tracks WHERE library_id=?1 AND seen<>?2", params![lib, scan_id]).unwrap();
-            tx.execute("UPDATE libraries SET last_scan=?1 WHERE id=?2", params![scan_id, lib]).unwrap();
+        if only.is_none() {
+            for (lib, _) in &libs {
+                tx.execute("DELETE FROM tracks WHERE library_id=?1 AND seen<>?2", params![lib, scan_id]).unwrap();
+                tx.execute("UPDATE libraries SET last_scan=?1 WHERE id=?2", params![scan_id, lib]).unwrap();
+            }
+        } else {
+            for (_, root) in &roots {
+                tx.execute("DELETE FROM tracks WHERE substr(path,1,length(?1)+1)=?1||'/' AND seen<>?2", params![root, scan_id]).unwrap();
+            }
         }
         // folders that are gone (deleted, or merged into their album as a disc subfolder); applied ones stay as history
         tx.execute("DELETE FROM proposals WHERE status<>'applied' AND dir NOT IN (SELECT dir FROM tracks)", []).unwrap();

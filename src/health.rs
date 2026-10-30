@@ -4,6 +4,7 @@ use crate::tags::Fields;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// Shown per list; the rest is counted.
 const LIMIT: usize = 500;
@@ -50,11 +51,59 @@ pub fn gaps(nums: &[(u32, u32)], total: &BTreeMap<u32, u32>) -> String {
     out.join("; ")
 }
 
+/// Tag fixes for an album whose discs sit in subfolders (`CD1/`, `Disc 2/`): DISCNUMBER from the folder,
+/// DISCTOTAL and TRACKTOTAL where they're missing or plainly wrong. Totals are never lowered below what a
+/// release claims unless they can't be right (a TRACKTOTAL below the highest track number, or the whole
+/// album's count on one disc), since a smaller count may just mean files are missing.
+/// `tracks` = (id, path, tags). Returns the changes per track id.
+pub fn disc_changes<'a>(dir: &str, tracks: impl IntoIterator<Item = (i64, &'a str, &'a Fields)>) -> BTreeMap<i64, Fields> {
+    let dir = Path::new(dir);
+    // (id, tags, disc from its folder)
+    let on_disc: Vec<(i64, &Fields, u32)> = tracks
+        .into_iter()
+        .filter_map(|(id, path, tags)| {
+            let parent = Path::new(path).parent()?;
+            (parent.parent() == Some(dir)).then_some(())?;
+            Some((id, tags, crate::scan::disc_folder(parent.file_name()?.to_str()?)? as u32))
+        })
+        .collect();
+    let discs: BTreeSet<u32> = on_disc.iter().map(|t| t.2).collect();
+    if discs.len() < 2 {
+        return BTreeMap::new(); // one disc folder isn't a multi-disc album to repair
+    }
+    let disc_total = discs.iter().max().copied().unwrap_or(1).max(discs.len() as u32);
+    let mut out = BTreeMap::new();
+    for &(id, tags, disc) in &on_disc {
+        let mut set = Fields::new();
+        if num(tags.get("DISCNUMBER")) != Some(disc) {
+            set.insert("DISCNUMBER".into(), disc.to_string());
+        }
+        if num(tags.get("DISCTOTAL")).is_none_or(|t| t < disc_total) {
+            set.insert("DISCTOTAL".into(), disc_total.to_string());
+        }
+        let here: Vec<&&Fields> = on_disc.iter().filter(|t| t.2 == disc).map(|t| &t.1).collect();
+        let highest = here.iter().filter_map(|t| num(t.get("TRACKNUMBER"))).max().unwrap_or(0);
+        let want = highest.max(here.len() as u32);
+        let wrong = match num(tags.get("TRACKTOTAL")) {
+            None => true,
+            Some(t) => t < highest || (t as usize == on_disc.len() && t > want),
+        };
+        if wrong && tags.get("TRACKTOTAL") != Some(&want.to_string()) {
+            set.insert("TRACKTOTAL".into(), want.to_string());
+        }
+        if !set.is_empty() {
+            out.insert(id, set);
+        }
+    }
+    out
+}
+
 fn lossy(format: &str, bit_depth: i64) -> bool {
     matches!(format, "MP3" | "AAC" | "OGG" | "Opus") || (format == "M4A" && bit_depth == 0) // ALAC has a bit depth
 }
 
 struct Row {
+    id: i64,
     path: String,
     format: String,
     bitrate: i64,
@@ -64,12 +113,13 @@ struct Row {
 
 pub fn report(c: &Connection) -> Value {
     let mut albums: BTreeMap<String, Vec<Row>> = BTreeMap::new();
-    let mut stmt = c.prepare("SELECT dir,path,format,bitrate,bit_depth,tags FROM tracks").unwrap();
+    let mut stmt = c.prepare("SELECT dir,path,format,bitrate,bit_depth,tags,id FROM tracks").unwrap();
     let rows = stmt
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 Row {
+                    id: r.get(6)?,
                     path: r.get(1)?,
                     format: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     bitrate: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
@@ -83,7 +133,7 @@ pub fn report(c: &Connection) -> Value {
         albums.entry(r.0).or_default().push(r.1);
     }
 
-    let (mut numbers, mut gap_list, mut artists, mut low) = (vec![], vec![], vec![], vec![]);
+    let (mut numbers, mut gap_list, mut artists, mut low, mut disc_list) = (vec![], vec![], vec![], vec![], vec![]);
     // folded name → spelling → tracks
     let mut spellings: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     for (dir, tracks) in &albums {
@@ -97,6 +147,14 @@ pub fn report(c: &Connection) -> Value {
         let g = gaps(&nums, &totals);
         if !g.is_empty() {
             gap_list.push(json!({ "dir": dir, "missing": g }));
+        }
+        let fixes = disc_changes(dir, tracks.iter().map(|t| (t.id, t.path.as_str(), &t.tags)));
+        if !fixes.is_empty() {
+            let mut fields: BTreeMap<&str, usize> = BTreeMap::new();
+            for k in fixes.values().flat_map(|f| f.keys()) {
+                *fields.entry(k).or_default() += 1;
+            }
+            disc_list.push(json!({ "dir": dir, "tracks": fixes.len(), "fields": fields }));
         }
         let values: BTreeSet<&str> = tracks.iter().filter_map(|t| t.tags.get("ALBUMARTIST").map(String::as_str)).collect();
         let without = tracks.iter().filter(|t| !t.tags.contains_key("ALBUMARTIST")).count();
@@ -131,6 +189,7 @@ pub fn report(c: &Connection) -> Value {
         "albums": albums.len(),
         "missing_numbers": cap(numbers),
         "gaps": cap(gap_list),
+        "disc_numbers": cap(disc_list),
         "album_artist": cap(artists),
         "spellings": cap(spell),
         "lossy_in_flac": cap(low),
@@ -148,6 +207,29 @@ mod tests {
         assert_eq!(fold("Simon & Garfunkel"), fold("Simon and Garfunkel"));
         assert_eq!(fold("AC/DC"), fold("ACDC"));
         assert_ne!(fold("Queen"), fold("Queens"));
+    }
+
+    #[test]
+    fn repairs_disc_folders() {
+        let f = |pairs: &[(&str, &str)]| -> Fields { pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+        // disc 2's files claim disc 1 and the album's 4 tracks as their total
+        let a = f(&[("DISCNUMBER", "1"), ("TRACKNUMBER", "1"), ("TRACKTOTAL", "2"), ("DISCTOTAL", "2")]);
+        let b = f(&[("DISCNUMBER", "1"), ("TRACKNUMBER", "2"), ("TRACKTOTAL", "2"), ("DISCTOTAL", "2")]);
+        let c = f(&[("DISCNUMBER", "1"), ("TRACKNUMBER", "1"), ("TRACKTOTAL", "4")]);
+        let d = f(&[("TRACKNUMBER", "2"), ("TRACKTOTAL", "4")]);
+        let tracks = [(1, "/m/X/CD1/01.flac", &a), (2, "/m/X/CD1/02.flac", &b), (3, "/m/X/CD2/01.flac", &c), (4, "/m/X/CD2/02.flac", &d)];
+        let out = disc_changes("/m/X", tracks);
+        assert!(!out.contains_key(&1) && !out.contains_key(&2), "disc 1 is right");
+        assert_eq!(out[&3], f(&[("DISCNUMBER", "2"), ("DISCTOTAL", "2"), ("TRACKTOTAL", "2")]));
+        assert_eq!(out[&4]["DISCNUMBER"], "2");
+
+        // a release total above the files present is kept: the missing track is missing, not wrong
+        let e = f(&[("DISCNUMBER", "2"), ("DISCTOTAL", "2"), ("TRACKNUMBER", "1"), ("TRACKTOTAL", "3")]);
+        let g = f(&[("DISCNUMBER", "2"), ("DISCTOTAL", "2"), ("TRACKNUMBER", "3"), ("TRACKTOTAL", "3")]);
+        let tracks = [(1, "/m/X/CD1/01.flac", &a), (2, "/m/X/CD1/02.flac", &b), (3, "/m/X/Disc 2/01.flac", &e), (4, "/m/X/Disc 2/03.flac", &g)];
+        assert!(disc_changes("/m/X", tracks).is_empty());
+        // a single disc folder is left alone
+        assert!(disc_changes("/m/X", [(1, "/m/X/CD1/01.flac", &d)]).is_empty());
     }
 
     #[test]

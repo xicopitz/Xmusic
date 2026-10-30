@@ -27,6 +27,24 @@ album is not reported as missing a cover, and xmusic does not embed a picture in
 like Navidrome already use the file. The album view shows a *cover file* badge. This is detected during scans,
 so run a scan after adding cover files.
 
+## Artist images
+
+Navidrome shows an `artist.*` file on the artist page. xmusic can save one for every album artist that has a
+MusicBrainz id: it follows the artist's MusicBrainz entry to Wikidata and downloads the photo listed there from
+Wikimedia Commons, 1000 px wide.
+
+- Run it with **Jobs → Fetch artist images**, or tick **Settings → Cover & lyrics → Save artist.jpg** to do it
+  at the end of every full run.
+- The image goes in the folder that holds all of the artist's albums (`Music/Artist/`). In a flat library
+  (`Music/Artist - Album/`), or when that folder also holds other artists' albums, each of the artist's album
+  folders gets one instead; Navidrome reads it there too. The library root never gets one.
+- An existing `artist.jpg`, `.jpeg`, `.png` or `.webp` is never replaced. Various Artists is skipped.
+- Artists without a photo on Wikidata are asked again after 30 days. Navidrome is asked to rescan when images
+  were saved.
+- Commons photos are freely licensed, most under Creative Commons with attribution; fine for a personal
+  library, but check the photo's page before publishing it elsewhere.
+- Bios aren't saved: Navidrome has no local file for them and gets them from Last.fm itself.
+
 ## Lyrics
 
 Source: [LRCLIB](https://lrclib.net), searched with the track's artist, title and album.

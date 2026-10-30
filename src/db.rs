@@ -52,7 +52,7 @@ pub fn init(c: &Connection) {
 }
 
 /// Schema changes after the first release, keyed on PRAGMA user_version.
-const LATEST: i64 = 5;
+const LATEST: i64 = 6;
 
 fn version(c: &Connection) -> i64 {
     c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
@@ -105,6 +105,10 @@ fn migrate(c: &Connection) {
     if version(c) < 5 {
         add_fields(&["DISCOGS_*"]); // albums matched on Discogs get DISCOGS_RELEASE_ID
         c.execute_batch("PRAGMA user_version=5;").expect("migration 5");
+    }
+    if version(c) < 6 {
+        add_fields(&["BARCODE"]); // matches write the release's barcode, so a re-match is exact
+        c.execute_batch("PRAGMA user_version=6;").expect("migration 6");
     }
     c.execute_batch("COMMIT").unwrap();
 }
@@ -170,6 +174,7 @@ CREATE TABLE IF NOT EXISTS stats_snapshots(ts INTEGER, tracks INTEGER, bytes INT
 CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, kind TEXT, started INTEGER, finished INTEGER, summary TEXT);
 CREATE TABLE IF NOT EXISTS trash(id INTEGER PRIMARY KEY, dir TEXT NOT NULL, moved_to TEXT NOT NULL, bytes INTEGER NOT NULL, ts INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS cover_files(dir TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS artist_images(artist_id TEXT PRIMARY KEY, checked INTEGER NOT NULL, found INTEGER NOT NULL);
 ";
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -215,6 +220,8 @@ pub struct Settings {
     pub cover_upgrade_below: u32,
     /// replace embedded covers whose shorter side is above this many px with the smaller CAA one (0 = never)
     pub cover_shrink_above: u32,
+    /// save artist.jpg (Wikimedia Commons, via MusicBrainz and Wikidata) during full runs
+    pub artist_images: bool,
     pub lyrics_enabled: bool,
     pub lyrics_prefer_synced: bool,
     pub lyrics_embed: bool,
@@ -235,6 +242,8 @@ pub struct Settings {
     pub navidrome_url: String,
     pub navidrome_user: String,
     pub navidrome_password: String,
+    /// token for POST /api/hook/import (Lidarr's webhook); empty = hook off
+    pub hook_token: String,
     /// files read or written at once; the work is network/disk bound, so more threads mostly add load
     pub io_threads: usize,
 }
@@ -250,7 +259,7 @@ impl Default for Settings {
             discogs_token: String::new(),
             contact_email: String::new(),
             write_fields: ["TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "DATE", "ORIGINALDATE", "TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL", "GENRE",
-                "LABEL", "CATALOGNUMBER", "MUSICBRAINZ_*", "DISCOGS_*"]
+                "LABEL", "CATALOGNUMBER", "BARCODE", "MUSICBRAINZ_*", "DISCOGS_*"]
                 .map(String::from)
                 .to_vec(),
             preserve_fields: vec!["COMMENT".into(), "REPLAYGAIN_*".into()],
@@ -263,6 +272,7 @@ impl Default for Settings {
             cover_size: "1200".into(),
             cover_upgrade_below: 500,
             cover_shrink_above: 0,
+            artist_images: false,
             lyrics_enabled: true,
             lyrics_prefer_synced: true,
             lyrics_embed: true,
@@ -279,6 +289,7 @@ impl Default for Settings {
             navidrome_url: String::new(),
             navidrome_user: String::new(),
             navidrome_password: String::new(),
+            hook_token: String::new(),
             io_threads: 3,
         }
     }
@@ -308,7 +319,7 @@ impl Settings {
 
     /// Secret fields are never sent to the browser: it gets `MASK` when one is set, and sends `MASK`
     /// back to keep the stored value.
-    pub const SECRETS: [&str; 4] = ["acoustid_key", "discogs_token", "gotify_token", "navidrome_password"];
+    pub const SECRETS: [&str; 5] = ["acoustid_key", "discogs_token", "gotify_token", "navidrome_password", "hook_token"];
     pub const MASK: &str = "••••••••";
 
     pub fn masked(&self) -> serde_json::Value {

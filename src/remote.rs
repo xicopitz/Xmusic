@@ -1,4 +1,4 @@
-//! HTTP clients: MusicBrainz, Discogs, AcoustID, Cover Art Archive, LRCLIB. Responses stay serde_json::Value.
+//! HTTP clients: MusicBrainz, Discogs, AcoustID, Cover Art Archive, LRCLIB, Wikidata/Commons. Responses stay serde_json::Value.
 
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
@@ -90,8 +90,27 @@ pub fn search_releases(contact: &str, artist: &str, album: &str, tracks: usize) 
         .collect())
 }
 
+/// Releases with this barcode (digits only).
+pub fn search_barcode(contact: &str, barcode: &str) -> Res<Vec<String>> {
+    let v = mb_get(contact, "release", &[("query", &format!("barcode:{barcode}")), ("limit", "5")])?;
+    Ok(v["releases"].as_array().into_iter().flatten().filter_map(|r| r["id"].as_str().map(String::from)).collect())
+}
+
+/// Releases holding a recording with this ISRC: (release id, its track count). The ISRC lookup endpoint
+/// leaves releases out, the recording search includes them.
+pub fn isrc_releases(contact: &str, isrc: &str) -> Res<Vec<(String, u64)>> {
+    let v = mb_get(contact, "recording", &[("query", &format!("isrc:{isrc}")), ("limit", "5")])?;
+    Ok(v["recordings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|r| r["releases"].as_array().cloned().unwrap_or_default())
+        .filter_map(|r| Some((r["id"].as_str()?.to_string(), r["track-count"].as_u64().unwrap_or(0))))
+        .collect())
+}
+
 pub fn release(contact: &str, mbid: &str) -> Res<Value> {
-    mb_get(contact, &format!("release/{mbid}"), &[("inc", "recordings artist-credits release-groups genres labels")])
+    mb_get(contact, &format!("release/{mbid}"), &[("inc", "recordings artist-credits release-groups genres labels isrcs")])
 }
 
 fn discogs_get(contact: &str, token: &str, path: &str, query: &[(&str, &str)]) -> Res<Value> {
@@ -108,8 +127,10 @@ fn discogs_get(contact: &str, token: &str, path: &str, query: &[(&str, &str)]) -
 }
 
 /// Discogs release ids for an artist + album, singles left out when the album has more tracks.
-pub fn discogs_search(contact: &str, token: &str, artist: &str, album: &str, tracks: usize) -> Res<Vec<String>> {
-    let v = discogs_get(contact, token, "database/search", &[("type", "release"), ("artist", artist), ("release_title", album), ("per_page", "10")])?;
+/// With a barcode the search is by barcode alone: it names the pressing.
+pub fn discogs_search(contact: &str, token: &str, artist: &str, album: &str, barcode: &str, tracks: usize) -> Res<Vec<String>> {
+    let q: &[(&str, &str)] = if barcode.is_empty() { &[("artist", artist), ("release_title", album)] } else { &[("barcode", barcode)] };
+    let v = discogs_get(contact, token, "database/search", &[&[("type", "release"), ("per_page", "10")][..], q].concat())?;
     Ok(v["results"]
         .as_array()
         .into_iter()
@@ -121,6 +142,32 @@ pub fn discogs_search(contact: &str, token: &str, artist: &str, album: &str, tra
 
 pub fn discogs_release(contact: &str, token: &str, id: &str) -> Res<Value> {
     discogs_get(contact, token, &format!("releases/{id}"), &[])
+}
+
+/// An artist's picture: MusicBrainz artist → its Wikidata item → that item's image (P18) on Wikimedia Commons,
+/// scaled to `width` px. Ok(None) when any link in the chain is missing.
+pub fn artist_image(contact: &str, mbid: &str, width: u32) -> Res<Option<Vec<u8>>> {
+    let v = mb_get(contact, &format!("artist/{mbid}"), &[("inc", "url-rels")])?;
+    let wikidata = v["relations"].as_array().into_iter().flatten().find(|r| r["type"] == "wikidata").and_then(|r| r["url"]["resource"].as_str());
+    let Some(item) = wikidata.and_then(|u| u.trim_end_matches('/').rsplit('/').next()) else { return Ok(None) };
+    let w: Value = counted("wikimedia", http(contact).get(format!("https://www.wikidata.org/wiki/Special:EntityData/{item}.json")).call())
+        .map_err(|e| format!("wikidata: {e}"))?
+        .body_mut()
+        .read_json()
+        .map_err(|e| format!("wikidata: {e}"))?;
+    // a merged item answers under its new id, so take whichever entity came back
+    let entity = w["entities"].as_object().and_then(|m| m.values().next()).cloned().unwrap_or_default();
+    let Some(file) = entity["claims"]["P18"][0]["mainsnak"]["datavalue"]["value"].as_str() else { return Ok(None) };
+    let req = http(contact)
+        .get("https://commons.wikimedia.org/w/index.php")
+        .query("title", "Special:FilePath")
+        .query("file", file)
+        .query("width", width.to_string());
+    match counted("wikimedia", req.call()) {
+        Ok(mut r) => r.body_mut().with_config().limit(20 << 20).read_to_vec().map(Some).map_err(|e| format!("commons: {e}")),
+        Err(ureq::Error::StatusCode(404)) => Ok(None),
+        Err(e) => Err(format!("commons: {e}")),
+    }
 }
 
 /// Runs chromaprint's fpcalc → (duration secs, fingerprint). None if fpcalc is missing or fails.

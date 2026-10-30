@@ -1,4 +1,5 @@
 mod apply;
+mod artist;
 mod auth;
 mod db;
 mod health;

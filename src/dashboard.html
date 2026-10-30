@@ -8,6 +8,11 @@
 <script src="/assets/tailwind-browser.js"></script>
 <script src="/assets/chart.umd.min.js"></script>
 <script>try { document.documentElement.dataset.theme = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') } catch {}</script>
+<style>
+/* upcoming job steps: base-300 vanishes on a dark card, so mix from the text colour */
+#job-card .step:not(.step-primary)::before, #job-card .step:not(.step-primary)::after { --step-bg: color-mix(in oklab, var(--color-base-content) 30%, var(--color-base-100)); --step-fg: var(--color-base-content); }
+#job-card .step-now::after { box-shadow: 0 0 0 4px color-mix(in oklab, var(--color-primary) 35%, transparent); }
+</style>
 </head>
 <body class="min-h-screen bg-base-200">
 
@@ -366,6 +371,7 @@ const pages = {
           <button class="btn" data-run="apply" title="Write the albums you approved in Review">✅ Apply approved</button>
           <button class="btn" data-run="covers" title="Cover Art Archive covers for tagged albums with no cover or a small one">🖼️ Fetch covers</button>
           <button class="btn" data-run="lyrics" title="LRCLIB lyrics for tracks without any (misses are retried after 30 days)">🎤 Fetch lyrics</button>
+          <button class="btn sm:col-span-4" data-run="artists" title="artist.jpg for album artists that have none, from Wikimedia Commons (needs MusicBrainz ids)">🧑‍🎤 Fetch artist images</button>
         </div>
         ${ME.admin ? `<div class="divider my-0 text-xs opacity-60">Maintenance</div>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -392,9 +398,9 @@ const pages = {
     const [s, libs] = await Promise.all([api('GET', '/api/settings'), api('GET', '/api/libraries')]);
     const tab = sessionStorage.getItem('settingsTab') || 'general';
     const txt = (k, label, help = '', type = 'text', attrs = '') => `<label class="form-control w-full"><span class="label text-sm font-medium">${label}</span>
-      <input class="input w-full" type="${type}" data-k="${k}" value="${esc(s[k])}" ${attrs}>${help ? `<span class="label text-xs opacity-70 whitespace-normal">${help}</span>` : ''}</label>`;
+      <input class="input w-full" type="${type}" data-k="${k}" value="${esc(s[k])}" ${attrs}>${help ? `<span class="label text-xs opacity-70 whitespace-normal"><span>${help}</span></span>` : ''}</label>`;
     const list = (k, label, help = '') => `<label class="form-control w-full"><span class="label text-sm font-medium">${label}</span>
-      <input class="input w-full" data-list="${k}" value="${esc(s[k].join(', '))}">${help ? `<span class="label text-xs opacity-70 whitespace-normal">${help}</span>` : ''}</label>`;
+      <input class="input w-full" data-list="${k}" value="${esc(s[k].join(', '))}">${help ? `<span class="label text-xs opacity-70 whitespace-normal"><span>${help}</span></span>` : ''}</label>`;
     const chk = (k, label) => `<label class="label cursor-pointer justify-start gap-3 whitespace-normal"><input type="checkbox" class="toggle toggle-primary shrink-0" data-k="${k}" ${s[k] ? 'checked' : ''}><span>${label}</span></label>`;
     // one rule per row; fields stack on phones, sit side by side from sm up
     const ruleRow = (cols, r = {}) => `<div class="rule-row grid grid-cols-1 sm:grid-cols-[1fr_1fr_1fr_auto] gap-2 items-end p-2 rounded-box bg-base-200 sm:bg-transparent sm:p-0">
@@ -403,25 +409,34 @@ const pages = {
     const rowsTable = (k, cols) => `<div class="hidden sm:grid grid-cols-[1fr_1fr_1fr_auto] gap-2 text-xs font-semibold opacity-70 mb-1">${cols.map(c => `<span>${c[1]}</span>`).join('')}<span class="w-12"></span></div>
       <div class="flex flex-col gap-2" data-rows="${k}">${s[k].map(r => ruleRow(cols, r)).join('')}</div>
       <button class="btn btn-sm mt-2" data-add="${k}" data-cols='${JSON.stringify(cols)}'>+ Add</button>`;
+    // one bordered box per topic or service, so each one's settings read as a group
+    const sec = (title, help, body) => `<section class="rounded-box border border-base-300 p-4">
+      <h3 class="font-semibold">${title}</h3>${help ? `<p class="text-xs opacity-70 mt-1">${help}</p>` : ''}
+      <div class="grid gap-4 md:grid-cols-2 mt-3">${body}</div></section>`;
     const tabs = { general: 'General', libraries: 'Libraries', metadata: 'Metadata', media: 'Cover & lyrics', notify: 'Integrations', backup: 'Backup' };
     el.innerHTML = `
       <div role="tablist" class="tabs tabs-box mb-4 w-fit flex-wrap">${Object.entries(tabs).map(([k, l]) => `<a role="tab" class="tab ${k === tab ? 'tab-active' : ''}" data-stab="${k}">${l}</a>`).join('')}</div>
       <div class="card bg-base-100 shadow-sm"><div class="card-body gap-4">
-      <div data-pane="general" class="grid gap-4 md:grid-cols-2">
-        ${txt('schedule', 'Scan schedule (cron)', 'Standard 5-field cron, e.g. <code>0 3 * * *</code> = every day at 03:00 (container time zone). Empty = no scheduled runs.')}
-        ${txt('contact_email', 'Contact e-mail', 'Sent in the MusicBrainz User-Agent, as their API rules require.', 'email')}
-        ${txt('match_threshold', 'Match threshold', 'Below this confidence an album goes to “Needs manual”.', 'number', 'step="0.01" min="0" max="1"')}
-        ${txt('io_threads', 'Parallel file operations', 'How many files are read or written at once. Lower is lighter on the NUC and on a network mount (rclone, SMB).', 'number', 'min="1" max="16"')}
-        ${txt('auto_apply_above', 'Auto-apply above', 'At or above this confidence changes are written without review. 0 = always review.', 'number', 'step="0.01" min="0" max="1"')}
-        <div class="flex flex-col gap-2">${txt('acoustid_key', 'AcoustID API key', 'An <b>application</b> key (acoustid.org → Register an application), not the user key on your profile. Enables fingerprint matching for badly tagged files.', 'password', 'autocomplete="off"')}
-          <div class="flex flex-wrap items-center gap-2"><button class="btn btn-sm" id="acoustid-test">Test key</button><span id="acoustid-status" class="text-sm"></span></div></div>
-        <div class="flex flex-col gap-2"><span class="text-sm font-medium">Discogs</span>
-          ${chk('discogs_enabled', 'Search Discogs when MusicBrainz has no good match')}
-          ${txt('discogs_token', 'Discogs token (optional)', 'A personal access token (discogs.com → Settings → Developers) raises Discogs’ limit from 25 to 60 lookups a minute. Matching works without one.', 'password', 'autocomplete="off"')}</div>
-        <div class="flex flex-col gap-2"><span class="text-sm font-medium">Watch mode</span>
-          ${chk('watch_enabled', 'Scan automatically when files in a library change')}
-          ${chk('watch_full_run', 'After changes, do a full run (match + apply) instead of a scan only')}
-          <span class="text-xs opacity-70">Starts 30 s after the last change. Network shares (NFS/SMB) don't report changes; use the schedule for those.</span></div>
+      <div data-pane="general" class="flex flex-col gap-4">
+        ${sec('⏱️ Runs', '', `
+          ${txt('schedule', 'Scan schedule (cron)', 'Standard 5-field cron, e.g. <code>0 3 * * *</code> = every day at 03:00 (container time zone). Empty = no scheduled runs.')}
+          ${txt('io_threads', 'Parallel file operations', 'How many files are read or written at once. Lower is lighter on the NUC and on a network mount (rclone, SMB).', 'number', 'min="1" max="16"')}
+          <div class="flex flex-col gap-2 md:col-span-2"><span class="text-sm font-medium">Watch mode</span>
+            ${chk('watch_enabled', 'Scan automatically when files in a library change')}
+            ${chk('watch_full_run', 'After changes, do a full run (match + apply) instead of a scan only')}
+            <span class="text-xs opacity-70">Starts 30 s after the last change. Network shares (NFS, SMB, rclone) don't report changes: use the schedule, or the Lidarr hook in Integrations.</span></div>`)}
+        ${sec('🎯 Matching', 'How sure a match must be. Applies to every source below.', `
+          ${txt('match_threshold', 'Match threshold', 'Below this confidence an album goes to “Needs manual”.', 'number', 'step="0.01" min="0" max="1"')}
+          ${txt('auto_apply_above', 'Auto-apply above', 'At or above this confidence changes are written without review. 0 = always review.', 'number', 'step="0.01" min="0" max="1"')}`)}
+        ${sec('🎼 MusicBrainz', 'The main source: releases by barcode, artist and title, or ISRC. Queried at most once a second, as their rules require.', `
+          ${txt('contact_email', 'Contact e-mail', 'Sent in the MusicBrainz User-Agent, as their API rules require.', 'email')}`)}
+        ${sec('🔊 AcoustID', 'Fingerprints up to three tracks of badly tagged albums with fpcalc and looks the recordings up on MusicBrainz.', `
+          ${txt('acoustid_key', 'API key', 'An <b>application</b> key (acoustid.org → Register an application), not the user key on your profile. Empty = off.', 'password', 'autocomplete="off"')}
+          <div class="flex flex-col gap-2 md:pt-7"><div class="flex flex-wrap items-center gap-2"><button class="btn btn-sm w-fit" id="acoustid-test">Test key</button><span id="acoustid-status" class="text-sm"></span></div>
+            <span class="text-xs opacity-70">Checks the saved key and fpcalc.</span></div>`)}
+        ${sec('💿 Discogs', 'The second source, for pressings and small releases MusicBrainz lacks. Asked only when MusicBrainz has no good match.', `
+          <div class="md:pt-7">${chk('discogs_enabled', 'Search Discogs when MusicBrainz has no good match')}</div>
+          ${txt('discogs_token', 'Token (optional)', 'A personal access token (discogs.com → Settings → Developers) raises the limit from 25 to 60 lookups a minute. Matching works without one.', 'password', 'autocomplete="off"')}`)}
       </div>
       <div data-pane="libraries">
         <div class="flex flex-wrap items-center gap-2 mb-2"><button class="btn btn-sm" id="lib-scan">🔄 Scan libraries</button><span class="text-xs opacity-70">Finds new, changed and removed files in every enabled library. No MusicBrainz lookups.</span></div>
@@ -452,22 +467,26 @@ const pages = {
           <label class="form-control"><span class="label text-sm">Size</span><select class="select" data-k="cover_size">${['250', '500', '1200', 'original'].map(v => `<option ${s.cover_size === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
           ${txt('cover_upgrade_below', 'Upgrade covers smaller than (px)', 'Embedded covers below this size are replaced when the Cover Art Archive has a bigger one. 0 = never. Undo restores the original.', 'number', 'min="0" step="50"')}
           ${txt('cover_shrink_above', 'Shrink covers larger than (px)', 'Embedded covers above this size are replaced by the Cover Art Archive one at the size above, when it is smaller. Saves space on huge scans. Needs a MusicBrainz id. 0 = never. Undo restores the original.', 'number', 'min="0" step="100"')}</div>
+        <div class="flex flex-col gap-2"><h3 class="font-semibold">Artist images (Wikimedia Commons)</h3>${chk('artist_images', 'Save artist.jpg for album artists during full runs')}
+          <span class="text-xs opacity-70">Goes in the artist's folder (or each album folder in a flat library), where Navidrome looks for it. Existing files are never replaced. Jobs → Fetch artist images runs it any time.</span></div>
         <div class="flex flex-col gap-2"><h3 class="font-semibold">Lyrics (LRCLIB)</h3>${chk('lyrics_enabled', 'Download lyrics')}${chk('lyrics_prefer_synced', 'Prefer time-synced lyrics')}${chk('lyrics_embed', 'Embed in the LYRICS tag')}${chk('lyrics_save_lrc', 'Save a .lrc file next to the track')}</div>
       </div>
-      <div data-pane="notify" class="grid gap-4 md:grid-cols-2">
-        <h3 class="font-semibold md:col-span-2">Gotify notifications</h3>
-        ${txt('gotify_url', 'Gotify server URL', 'e.g. https://gotify.example.com')}
-        ${txt('gotify_token', 'Application token', '', 'password')}
-        ${txt('gotify_priority', 'Priority', '', 'number', 'min="0" max="10"')}
-        <div class="flex flex-col gap-2">${chk('notify_finished', 'When a run finishes')}${chk('notify_review', 'When albums need review')}${chk('notify_error', 'When a job fails')}</div>
-        ${txt('public_url', 'Dashboard address', 'How you open xmusic, e.g. http://192.168.1.73:8337. Tapping a notification opens the Review or Jobs page there.')}
-        <div><button class="btn" id="notify-test">Send test notification</button><p class="text-xs opacity-70 mt-1">Uses the saved settings, so save first.</p></div>
-        <h3 class="font-semibold md:col-span-2 mt-4">Navidrome</h3>
-        <p class="text-xs opacity-70 md:col-span-2 -mt-2">After a job changes files, xmusic asks Navidrome (or any Subsonic server) to rescan, so fixes show up right away. Leave the URL empty to turn it off.</p>
-        ${txt('navidrome_url', 'Navidrome URL', 'e.g. http://192.168.1.73:4533')}
-        ${txt('navidrome_user', 'User', 'A Navidrome admin: only admins can start a scan.')}
-        ${txt('navidrome_password', 'Password', '', 'password')}
-        <div><button class="btn" id="navidrome-test">Start a Navidrome scan</button><p class="text-xs opacity-70 mt-1">Uses the saved settings, so save first.</p></div>
+      <div data-pane="notify" class="flex flex-col gap-4">
+        ${sec('🔔 Gotify', 'Push notifications when a job finishes, albums need review, or a job fails. Leave the URL empty to turn them off.', `
+          ${txt('gotify_url', 'Server URL', 'e.g. https://gotify.example.com')}
+          ${txt('gotify_token', 'Application token', '', 'password')}
+          ${txt('gotify_priority', 'Priority', '', 'number', 'min="0" max="10"')}
+          <div class="flex flex-col gap-2">${chk('notify_finished', 'When a run finishes')}${chk('notify_review', 'When albums need review')}${chk('notify_error', 'When a job fails')}</div>
+          ${txt('public_url', 'Dashboard address', 'How you open xmusic, e.g. http://192.168.1.73:8337. Tapping a notification opens the Review or Jobs page there.')}
+          <div class="md:pt-7"><button class="btn" id="notify-test">Send test notification</button><p class="text-xs opacity-70 mt-1">Uses the saved settings, so save first.</p></div>`)}
+        ${sec('🎧 Navidrome', 'After a job changes files, xmusic asks Navidrome (or any Subsonic server) to rescan, so fixes show up right away. Leave the URL empty to turn it off.', `
+          ${txt('navidrome_url', 'URL', 'e.g. http://192.168.1.73:4533')}
+          ${txt('navidrome_user', 'User', 'A Navidrome admin: only admins can start a scan.')}
+          ${txt('navidrome_password', 'Password', '', 'password')}
+          <div class="md:pt-7"><button class="btn" id="navidrome-test">Start a Navidrome scan</button><p class="text-xs opacity-70 mt-1">Uses the saved settings, so save first.</p></div>`)}
+        ${sec('📥 Lidarr', 'Import hook: when Lidarr imports an album, xmusic scans, matches and finishes just that album (cover, lyrics) right away, instead of at the next scheduled run. Network mounts like rclone never tell watch mode about new files, so this is how they get noticed. Empty token = off.', `
+          ${txt('hook_token', 'Hook token', 'The hook URL carries it. Saved tokens stay hidden: generate a new one to see the URL again.', 'password', 'autocomplete="off"')}
+          <div class="flex flex-col gap-1 md:pt-7"><button class="btn w-fit" id="hook-gen">Generate token</button><div id="hook-url" class="text-xs break-all"></div></div>`)}
       </div>
       <div data-pane="backup" class="grid gap-6 md:grid-cols-2">
         <div class="flex flex-col gap-2"><h3 class="font-semibold">Back up</h3>
@@ -517,6 +536,19 @@ const pages = {
       const badge = (ok, text) => `<span class="badge ${ok ? 'badge-success' : 'badge-error'}">${esc(text)}</span>`;
       out.innerHTML = `${badge(r.key_ok, r.key_ok ? 'Key accepted' : r.key)} ${badge(r.fpcalc.Ok, r.fpcalc.Ok || r.fpcalc.Err)}<span class="text-xs opacity-70 ml-1">Uses the saved key.</span>`;
     });
+    $('#hook-gen', el).onclick = () => {
+      const token = [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, '0')).join('');
+      const input = $('[data-k=hook_token]', el);
+      input.value = token;
+      input.type = 'text';
+      const url = `${(s.public_url || location.origin).replace(/\/$/, '')}/api/hook/import`;
+      const code = v => `<code class="block bg-base-200 rounded p-2 my-1 select-all">${esc(v)}</code>`;
+      $('#hook-url', el).innerHTML = `<p class="font-medium">Save settings, then in Lidarr → Settings → Connect → + → Webhook set <b>URL</b> to</p>
+        ${code(url)}<p>and <b>Password</b> to the token (any Username):</p>${code(token)}
+        <p class="opacity-70">Or leave Password empty and use the URL with the token in it: ${code(`${url}?token=${token}`)}
+        Use the address you open xmusic with: Lidarr runs in another container, so <code>xmusic</code> or <code>localhost</code> won't reach it.
+        Tick <b>On Release Import</b>, <b>On Upgrade</b> and <b>On Rename</b>, then press Test.</p>`;
+    };
     $('#navidrome-test', el).onclick = guard(async () => { await post('/api/navidrome/test'); toast('Navidrome scan started') });
     $('#lib-browse', el).onclick = guard(() => browseFolders($('#lib-add [name=path]', el).value, path => {
       $('#lib-add [name=path]', el).value = path;
@@ -678,6 +710,8 @@ async function renderHealth(body) {
       x => `${dirBtn(x.dir)}<span class="opacity-70">${x.missing} of ${x.tracks} tracks</span>${rematch(x.dir)}`)}
     ${section('Gaps in track numbers', 'Numbers missing between 1 and the last track (or TRACKTOTAL). Usually a file is missing, which only you can add; re-match fixes wrong numbers or totals.', h.gaps,
       x => `${dirBtn(x.dir)}<span class="opacity-70">missing ${esc(x.missing)}</span>${rematch(x.dir)}`)}
+    ${section('Disc numbers', `Albums with discs in subfolders (CD1, Disc 2…) whose DISCNUMBER, DISCTOTAL or TRACKTOTAL don't match the folders.${ME.admin && h.disc_numbers.total ? ' <button class="btn btn-xs btn-primary" data-discs-all>Fix all</button>' : ''}`, h.disc_numbers,
+      x => `${dirBtn(x.dir)}<span class="opacity-70">${x.tracks} tracks: ${Object.entries(x.fields).map(([k, n]) => `${esc(k)} ×${n}`).join(', ')}</span>${ME.admin ? `<button class="btn btn-xs btn-primary ml-auto" data-discs="${esc(x.dir)}">Fix</button>` : ''}`)}
     ${section('Mixed album artists', 'Tracks in one album folder disagree on ALBUMARTIST, so players can split the album. Re-match sets one for all tracks.', h.album_artist,
       x => `${dirBtn(x.dir)}${x.values.map(v => `<span class="badge badge-ghost">${esc(v)}</span>`).join('')}${x.without ? `<span class="opacity-70">${x.without} without</span>` : ''}${rematch(x.dir)}`)}
     ${section('Artist spellings', `Names that only differ in case, accents, punctuation or a leading “The”.${ME.admin ? ' Press <b>Use</b> on the right one: the others are renamed in ARTIST and ALBUMARTIST, and a rewrite rule keeps it that way.' : ''}`, h.spellings,
@@ -688,6 +722,13 @@ async function renderHealth(body) {
   $$('[data-dir]', body).forEach(b => b.onclick = guard(() => openAlbum(b.dataset.dir)));
   $$('[data-artist]', body).forEach(b => b.onclick = () => { LIB.artist = b.dataset.artist; LIB.view = 'albums'; LIB.offset = 0; route() });
   $$('[data-rematch]', body).forEach(b => b.onclick = guard(async () => { await post('/api/rematch', { dir: b.dataset.rematch }); b.disabled = true; toast('Re-matching; the result lands in Review'); poll() }));
+  // tags straight from the folder layout: written right away (undo restores them)
+  $$('[data-discs]', body).forEach(b => b.onclick = guard(async () => { await post('/api/health/discs', { dir: b.dataset.discs }); b.disabled = true; toast('Fixing disc numbers'); poll() }));
+  $('[data-discs-all]', body)?.addEventListener('click', guard(async e => {
+    e.preventDefault();
+    if (!confirm(`Fix disc numbers in ${h.disc_numbers.total} album(s)? Undo restores them.`)) return;
+    await post('/api/health/discs', {}); $$('[data-discs], [data-discs-all]', body).forEach(x => x.disabled = true); toast('Fixing disc numbers'); poll();
+  }));
   $$('[data-use]', body).forEach(b => b.onclick = guard(async () => {
     const group = h.spellings.items[+b.dataset.use], to = b.dataset.name, from = group.filter(n => n.name !== to);
     const n = from.reduce((a, x) => a + x.tracks, 0);
@@ -722,7 +763,9 @@ async function openAlbum(dir) {
           ${discogs ? `<a class="link" target="_blank" rel="noopener" href="${esc(releaseUrl('discogs:' + discogs))}">Discogs ↗</a>` : ''}
           ${mbid || discogs ? '' : '<span class="badge badge-warning badge-sm">no release ID</span>'}
           ${a.proposal ? `<a class="link" data-proposal="${a.proposal.id}">Proposal (${esc(a.proposal.status)})</a>` : ''}
-          <button class="btn btn-xs" data-rematch title="Look this album up again and propose fixes for wrong titles and tags">🔄 Re-match</button></div>
+          <button class="btn btn-xs" data-rematch title="Look this album up again and propose fixes for wrong titles and tags">🔄 Re-match</button>
+          <button class="btn btn-xs" data-fetch="covers" ${mbid ? '' : 'disabled'} title="${mbid ? 'Embed the Cover Art Archive front cover if the album has none (or a too small / too big one)' : 'Needs a MusicBrainz release ID: re-match first'}">🖼️ Fetch cover</button>
+          <button class="btn btn-xs" data-fetch="lyrics" title="Look up lyrics on LRCLIB for tracks without them, including ones not found before">🎤 Fetch lyrics</button></div>
         <p class="text-xs font-mono opacity-50 break-all">${esc(dir)}</p>
       </div>
     </div>
@@ -741,6 +784,10 @@ async function openAlbum(dir) {
     <div class="modal-action"><form method="dialog"><button class="btn">Close</button></form></div>`;
   $('[data-proposal]', body)?.addEventListener('click', guard(() => openProposal(a.proposal.id)));
   $('[data-rematch]', body).addEventListener('click', guard(() => rematchAlbum(dir)));
+  $$('[data-fetch]', body).forEach(b => b.addEventListener('click', guard(async () => {
+    await post('/api/album/fetch', { dir, what: b.dataset.fetch });
+    b.disabled = true; toast(`Fetching ${b.dataset.fetch} for this album; see Jobs`); poll();
+  })));
   if (!$('#modal').open) $('#modal').showModal();
 }
 
@@ -834,7 +881,7 @@ function renderJob(j) {
       <div class="stat p-3"><div class="stat-title">This phase</div><div class="stat-value text-2xl">${j.phase_eta != null ? '~' + dur(j.phase_eta) : '—'}</div></div>
       <div class="stat p-3"><div class="stat-title">Whole run (estimate)</div><div class="stat-value text-2xl">${j.eta != null ? '~' + dur(j.eta) : '—'}</div><div class="stat-desc">done ≈ ${j.eta != null ? new Date(Date.now() + j.eta * 1000).toLocaleTimeString() : '—'}</div></div>
     </div>
-    ${j.upcoming.length ? `<ul class="steps steps-vertical sm:steps-horizontal text-xs"><li class="step step-primary">${esc(j.phase.split(':')[0])}</li>${j.upcoming.map(([n, c]) => `<li class="step">${esc(n)} (${c})</li>`).join('')}</ul>` : ''}`);
+    <ul class="steps steps-vertical sm:steps-horizontal text-xs w-full">${j.finished.map(([n, t]) => `<li class="step step-primary" data-content="✓">${esc(n)} · ${dur(t)}</li>`).join('')}<li class="step step-primary step-now font-semibold" data-content="●">${esc(j.phase)}${j.total ? ` (${j.done.toLocaleString()} / ${j.total.toLocaleString()})` : ''}</li>${j.upcoming.map(([n, c]) => `<li class="step">${esc(n)}${c ? ` (${c.toLocaleString()})` : ''}</li>`).join('')}</ul>`);
 }
 async function poll() {
   let j;

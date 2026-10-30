@@ -91,6 +91,102 @@ pub fn rows(c: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<Value> {
     .collect()
 }
 
+/// Lidarr events whose files moved or went away: a library scan catches up with them.
+const HOOK_SCAN_EVENTS: [&str; 5] = ["Rename", "Retag", "TrackFileDelete", "AlbumDelete", "ArtistDelete"];
+
+/// Album folders an import hook call is about: Lidarr's `trackFiles[].path`, or `{"path": …}` from a script,
+/// kept only inside a library. None = nothing was imported (any other event).
+// ponytail: paths are taken as xmusic sees them; Lidarr mounts the music at the same /music. Add a prefix
+// map setting if the two containers ever mount it differently.
+fn hook_dirs(body: &Value, libraries: &[String]) -> Option<Vec<String>> {
+    let paths: Vec<&str> = match body["path"].as_str() {
+        Some(p) => vec![p],
+        None => body["trackFiles"].as_array()?.iter().filter_map(|f| f["path"].as_str()).collect(),
+    };
+    let mut dirs: Vec<String> = paths
+        .iter()
+        .map(std::path::Path::new)
+        .filter(|p| libraries.iter().any(|l| p.starts_with(l)))
+        .map(|p| if body["path"].is_string() { p.to_string_lossy().trim_end_matches('/').to_string() } else { crate::scan::album_dir(p) })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    Some(dirs)
+}
+
+/// Standard base64 (as in a Basic auth header) → bytes; None if malformed.
+fn base64(s: &str) -> Option<Vec<u8>> {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let (mut out, mut acc, mut bits) = (vec![], 0u32, 0);
+    for c in s.trim().trim_end_matches('=').bytes() {
+        acc = acc << 6 | ABC.iter().position(|&a| a == c)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// The hook token: `?token=` in the URL, or the password of a Basic auth header (Lidarr's webhook has
+/// Username/Password fields but no header field); the username is ignored.
+fn hook_token(query: &str, authorization: Option<&str>) -> String {
+    let basic = || {
+        let raw = base64(authorization?.strip_prefix("Basic ")?)?;
+        Some(String::from_utf8(raw).ok()?.split_once(':')?.1.to_string())
+    };
+    query.split('&').find_map(|kv| kv.strip_prefix("token=")).map(String::from).or_else(basic).unwrap_or_default()
+}
+
+fn hook(c: &Connection, query: &str, authorization: Option<&str>, body: &Value) -> Resp {
+    let want = Settings::load(c).hook_token;
+    if want.is_empty() {
+        return err(404, "the import hook is off: set a token in Settings → Integrations");
+    }
+    let got = hook_token(query, authorization);
+    // compare every byte, so the time taken doesn't tell how much of a guess was right
+    if got.len() != want.len() || got.bytes().zip(want.bytes()).fold(0, |acc, (a, b)| acc | (a ^ b)) != 0 {
+        return err(403, "wrong token");
+    }
+    let event = body["eventType"].as_str().unwrap_or_default();
+    if event == "Test" {
+        return ok(json!({"ok": true}));
+    }
+    let libraries: Vec<String> = c
+        .prepare("SELECT path FROM libraries WHERE enabled=1")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    match hook_dirs(body, &libraries) {
+        Some(dirs) if dirs.is_empty() => err(400, "no file of this import is inside an enabled library"),
+        Some(dirs) => {
+            let n = dirs.len();
+            let started = job::import(dirs);
+            ok(json!({ "albums": n, "started": started, "queued": !started }))
+        }
+        None if HOOK_SCAN_EVENTS.contains(&event) => ok(json!({ "scan": job::start(job::Kind::Scan) })),
+        None => ok(json!({ "ignored": event })),
+    }
+}
+
+#[test]
+fn hook_payloads() {
+    let libs = vec!["/music".to_string()];
+    let lidarr = json!({ "eventType": "Download", "trackFiles": [
+        { "path": "/music/Tuff/Fire/CD1/01.flac" }, { "path": "/music/Tuff/Fire/CD2/01.flac" },
+        { "path": "/music/Tuff/Water/01.flac" }, { "path": "/downloads/x.flac" } ] });
+    assert_eq!(hook_dirs(&lidarr, &libs).unwrap(), vec!["/music/Tuff/Fire", "/music/Tuff/Water"], "disc folders fold, outside paths drop");
+    assert_eq!(hook_dirs(&json!({ "path": "/music/Tuff/Fire/" }), &libs).unwrap(), vec!["/music/Tuff/Fire"]);
+    assert!(hook_dirs(&json!({ "eventType": "Grab" }), &libs).is_none());
+    // token in the URL, or as the Basic auth password ("lidarr:s3cret")
+    assert_eq!(hook_token("a=1&token=abc", None), "abc");
+    assert_eq!(hook_token("", Some("Basic bGlkYXJyOnMzY3JldA==")), "s3cret");
+    assert_eq!(hook_token("", Some("Basic !!")), "");
+}
+
 /// A pasted release: an MBID or musicbrainz.org/release/<mbid> link, a discogs.com/…/release/<n>-slug link,
 /// or an id as stored (`discogs:<n>`). Discogs ids come back as `discogs:<n>`.
 fn release_id(input: &str) -> Option<String> {
@@ -186,7 +282,10 @@ fn handle(req: &mut Request) -> Resp {
                 None => err(404, "not found"),
             };
         }
-        return Response::from_data(include_str!("dashboard.html")).with_header(header("Content-Type", "text/html; charset=utf-8"));
+        // no-cache: after a deploy the browser must not keep running the old UI
+        return Response::from_data(include_str!("dashboard.html"))
+            .with_header(header("Content-Type", "text/html; charset=utf-8"))
+            .with_header(header("Cache-Control", "no-cache"));
     }
 
     // JSON-only writes: a cross-site form can't send application/json without a CORS preflight
@@ -214,6 +313,11 @@ fn handle(req: &mut Request) -> Resp {
 
     // public routes
     match (&method, seg.as_slice()) {
+        // public so Lidarr can call it; the token in the URL is the login
+        (Method::Post, ["api", "hook", "import"]) => {
+            let basic = req.headers().iter().find(|h| h.field.equiv("Authorization")).map(|h| h.value.as_str().to_string());
+            return hook(&c, &query, basic.as_deref(), &body);
+        }
         (Method::Get, ["api", "setup"]) => return ok(json!({ "needs_setup": auth::user_count(&c) == 0 })),
         (Method::Post, ["api", "setup"]) => {
             if auth::user_count(&c) > 0 {
@@ -264,8 +368,9 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
                 "full" => job::Kind::Full,
                 "apply" => job::Kind::Apply,
                 "scan" => job::Kind::Scan,
-                "covers" => job::Kind::Covers,
-                "lyrics" => job::Kind::Lyrics,
+                "covers" => job::Kind::Covers(None),
+                "lyrics" => job::Kind::Lyrics(None),
+                "artists" => job::Kind::ArtistImages,
                 "rules" if user.admin => job::Kind::Rules,
                 _ => return err(400, "unknown or forbidden job kind"),
             };
@@ -285,6 +390,18 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
                 return err(404, "album folder not found in the library");
             }
             if job::start(job::Kind::Rematch(vec![dir])) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
+        }
+        (Method::Post, ["api", "album", "fetch"]) => {
+            let dir = s("dir");
+            if c.query_row("SELECT 1 FROM tracks WHERE dir=?1 LIMIT 1", [&dir], |_| Ok(())).is_err() {
+                return err(404, "album folder not found in the library");
+            }
+            let kind = match s("what").as_str() {
+                "covers" => job::Kind::Covers(Some(vec![dir])),
+                "lyrics" => job::Kind::Lyrics(Some(vec![dir])),
+                _ => return err(400, "what must be covers or lyrics"),
+            };
+            if job::start(kind) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
         }
         (Method::Post, ["api", "library"]) => ok(library(c, body)),
         (Method::Post, ["api", "library", "album"]) => ok(album(c, &s("dir"))),
@@ -345,6 +462,10 @@ fn api(c: &Connection, method: &Method, seg: &[&str], query: &str, body: &Value,
                 Ok(()) => ok(json!({"ok": true})),
                 Err(e) => err(502, &e),
             }
+        }
+        (Method::Post, ["api", "health", "discs"]) => {
+            let dirs = body["dir"].as_str().map(|d| vec![d.to_string()]);
+            if job::start(job::Kind::Discs(dirs)) { ok(json!({"ok": true})) } else { err(409, "a job is already running") }
         }
         (Method::Post, ["api", "health", "spelling"]) => {
             let to = s("to");

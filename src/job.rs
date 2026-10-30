@@ -35,6 +35,27 @@ static ST: LazyLock<Mutex<State>> = LazyLock::new(|| {
 });
 static WAKE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 static CANCEL: AtomicBool = AtomicBool::new(false);
+/// Album folders the import hook announced while another job ran; imported when it ends.
+static PENDING_IMPORT: Mutex<std::collections::BTreeSet<String>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Import hook: scan, match and finish these album folders now, or right after the running job.
+/// Returns whether it started now (false = queued).
+pub fn import(dirs: Vec<String>) -> bool {
+    PENDING_IMPORT.lock().unwrap().extend(dirs);
+    start_pending()
+}
+
+fn start_pending() -> bool {
+    let dirs: Vec<String> = std::mem::take(&mut *PENDING_IMPORT.lock().unwrap()).into_iter().collect();
+    if dirs.is_empty() {
+        return false;
+    }
+    if start(Kind::Import(dirs.clone())) {
+        return true;
+    }
+    PENDING_IMPORT.lock().unwrap().extend(dirs); // busy: keep them for the end of the running job
+    false
+}
 
 /// Panic payload that unwinds a cancelled job out of whatever phase it is in.
 struct Cancelled;
@@ -45,6 +66,7 @@ fn seed(phase: &str) -> f64 {
         "scan" => 0.01,
         "match" => 4.4,
         "albums" => 8.0,
+        "artist images" => 3.0,
         _ => 0.05,
     }
 }
@@ -127,6 +149,7 @@ pub struct Status {
     phase_eta: Option<f64>,
     eta: Option<f64>,
     upcoming: Vec<(&'static str, u64)>,
+    finished: Vec<(String, f64)>,
     last: Option<String>,
     cancelling: bool,
 }
@@ -145,6 +168,7 @@ pub fn status() -> Status {
         phase_eta,
         eta: phase_eta.map(|p| p + rest),
         upcoming: s.upcoming.iter().map(|(n, c, _)| (*n, *c)).collect(),
+        finished: s.took.iter().filter(|(n, _)| !s.phase.starts_with(n.as_str())).cloned().collect(),
         last: s.last.clone(),
         cancelling: s.running && CANCEL.load(Relaxed),
     }
@@ -158,8 +182,15 @@ pub enum Kind {
     Rules,
     /// Health → artist spellings: these names become the last one
     Rename(Vec<String>, String),
-    Covers,
-    Lyrics,
+    /// Health → disc numbers; None = every album
+    Discs(Option<Vec<String>>),
+    /// artist.jpg next to each artist's albums
+    ArtistImages,
+    /// the import hook: a full run limited to these album folders
+    Import(Vec<String>),
+    /// None = every album that needs one
+    Covers(Option<Vec<String>>),
+    Lyrics(Option<Vec<String>>),
     Undo(Option<String>),
 }
 
@@ -182,8 +213,11 @@ pub fn start(kind: Kind) -> bool {
             Kind::Rematch(_) => "re-match",
             Kind::Rules => "custom tags & rewrites",
             Kind::Rename(..) => "rename artist",
-            Kind::Covers => "fetch covers",
-            Kind::Lyrics => "fetch lyrics",
+            Kind::Discs(_) => "fix disc numbers",
+            Kind::ArtistImages => "artist images",
+            Kind::Import(_) => "import",
+            Kind::Covers(_) => "fetch covers",
+            Kind::Lyrics(_) => "fetch lyrics",
             Kind::Undo(_) => "undo",
         }
         .into();
@@ -237,8 +271,9 @@ pub fn start(kind: Kind) -> bool {
         }
         // albums approved while another job ran (or after the album pass's last look) get applied now;
         // only after a clean finish, so a failing apply can't restart itself forever
+        // imports announced meanwhile come first; their own end chains the apply
         let waiting = "SELECT EXISTS(SELECT 1 FROM proposals WHERE status='approved' AND dir IN (SELECT dir FROM tracks))";
-        if res.is_ok() && c.query_row(waiting, [], |r| r.get::<_, bool>(0)).unwrap() {
+        if !start_pending() && res.is_ok() && c.query_row(waiting, [], |r| r.get::<_, bool>(0)).unwrap() {
             start(Kind::Apply);
         }
     });
@@ -321,21 +356,65 @@ const NEEDS_MATCH: &str = "FROM tracks WHERE dir NOT IN (SELECT dir FROM tracks 
       OR json_extract(tags,'$.DISCOGS_RELEASE_ID') IS NOT NULL)
     AND dir NOT IN (SELECT dir FROM proposals WHERE status IN ('review','manual','rejected','approved'))";
 
+/// Matches these albums and stores their proposals. Returns (auto-approved, parked for review).
+fn match_dirs(c: &rusqlite::Connection, dirs: &[String], s: &Settings) -> (usize, usize) {
+    phase("match", dirs.len() as u64);
+    let (mut auto, mut review) = (0, 0);
+    for dir in dirs {
+        let tracks = db::tracks_where(c, "dir=?1", [dir]);
+        let p = matcher::match_album(&tracks, s);
+        match p.status {
+            "approved" => auto += 1,
+            _ => review += 1,
+        }
+        store_proposal(c, dir, &p);
+        tick();
+    }
+    (auto, review)
+}
+
 fn run(kind: Kind, s: &Settings) -> String {
     match kind {
         Kind::Apply => {
-            let d = apply::albums(s, apply::Pass::APPROVED);
+            let d = apply::albums(s, apply::Pass::APPROVED, None);
             format!("{} album(s) applied, {} failed; {} file(s) written", d.applied, d.failed, d.files)
         }
         Kind::Rematch(dirs) => rematch(&dirs, s),
         Kind::Scan => format!("{} new or changed file(s) read", scan::run(&mut db::open())),
         Kind::Rules => format!("{} file(s) updated", apply::rules_everywhere(s)),
+        Kind::Discs(dirs) => format!("{} file(s) got disc numbers fixed", apply::fix_discs(s, dirs.as_deref())),
+        Kind::ArtistImages => crate::artist::images(s).to_string(),
+        Kind::Import(dirs) => {
+            let mut c = db::open();
+            let read = scan::run_in(&mut c, Some(&dirs));
+            // the scan may fold a disc subfolder into its album, so ask the db which albums these are now
+            let albums: Vec<String> = c
+                .prepare(&format!("SELECT DISTINCT dir {NEEDS_MATCH} AND dir IN (SELECT value FROM json_each(?1))"))
+                .unwrap()
+                .query_map([serde_json::to_string(&dirs).unwrap()], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let (auto, review) = match_dirs(&c, &albums, s);
+            let d = apply::albums(s, apply::Pass::ALL, Some(&dirs));
+            format!(
+                "{} folder(s): {read} file(s) read, {} matched ({auto} auto-approved, {review} for review); {} file(s) written, {} cover(s), lyrics for {} track(s)",
+                dirs.len(), albums.len(), d.files, d.covers, d.lyrics
+            )
+        }
         Kind::Rename(from, to) => format!("{} file(s) renamed to {to}", apply::rename_artist(s, &from, &to)),
-        Kind::Covers if !s.cover_embed => "cover art is turned off in Settings".into(),
-        Kind::Covers => format!("{} file(s) got a cover", apply::albums(s, apply::Pass::COVERS).covers),
-        Kind::Lyrics if !apply::wants_lyrics(s) => "lyrics are turned off in Settings".into(),
-        Kind::Lyrics => {
-            let d = apply::albums(s, apply::Pass::LYRICS);
+        Kind::Covers(_) if !s.cover_embed => "cover art is turned off in Settings".into(),
+        Kind::Covers(dirs) => format!("{} file(s) got a cover", apply::albums(s, apply::Pass::COVERS, dirs.as_deref()).covers),
+        Kind::Lyrics(_) if !apply::wants_lyrics(s) => "lyrics are turned off in Settings".into(),
+        Kind::Lyrics(dirs) => {
+            if let Some(dirs) = &dirs {
+                // asked for by hand: earlier misses are tried again now, not after the retry delay
+                let c = db::open();
+                for d in dirs {
+                    c.execute("UPDATE tracks SET lyrics_miss=NULL WHERE dir=?1", [d]).unwrap();
+                }
+            }
+            let d = apply::albums(s, apply::Pass::LYRICS, dirs.as_deref());
             format!("lyrics for {} track(s); {} file(s) written", d.lyrics, d.files)
         }
         Kind::Undo(dir) => format!("{} file(s) restored", apply::undo(dir.as_deref())),
@@ -352,20 +431,9 @@ fn run(kind: Kind, s: &Settings) -> String {
                 .collect();
             plan(vec![("match", dirs.len() as u64, seed("match")), ("albums", 0, seed("albums"))]);
 
-            phase("match", dirs.len() as u64);
-            let (mut auto, mut review) = (0, 0);
-            for dir in &dirs {
-                let tracks = db::tracks_where(&c, "dir=?1", [dir]);
-                let p = matcher::match_album(&tracks, s);
-                match p.status {
-                    "approved" => auto += 1,
-                    _ => review += 1,
-                }
-                store_proposal(&c, dir, &p);
-                tick();
-            }
+            let (auto, review) = match_dirs(&c, &dirs, s);
             plan(vec![("albums", apply::album_dirs(&c, s, apply::Pass::ALL).len() as u64, seed("albums"))]);
-            let d = apply::albums(s, apply::Pass::ALL);
+            let d = apply::albums(s, apply::Pass::ALL, None);
             let applied = d.applied;
 
             let review_total = count(&c, "SELECT COUNT(*) FROM proposals WHERE status IN ('review','manual')");
@@ -381,8 +449,9 @@ fn run(kind: Kind, s: &Settings) -> String {
                 ],
             )
             .unwrap();
+            let artists = if s.artist_images { format!("; {}", crate::artist::images(s)) } else { String::new() };
             format!(
-                "{scanned} file(s) read, {} album(s) matched: {auto} auto-approved, {review} parked for review; {applied} applied ({} failed); {} file(s) written, {} cover(s), lyrics for {} track(s)",
+                "{scanned} file(s) read, {} album(s) matched: {auto} auto-approved, {review} parked for review; {applied} applied ({} failed); {} file(s) written, {} cover(s), lyrics for {} track(s){artists}",
                 dirs.len(), d.failed, d.files, d.covers, d.lyrics
             )
         }

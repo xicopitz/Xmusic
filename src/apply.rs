@@ -128,9 +128,13 @@ fn lyrics_retry() -> i64 {
 
 /// The write pass. Each album fetches what it lacks (cover once, lyrics per track) and then writes
 /// every track at most once: approved tags + cover + lyrics together. Albums run `io_threads` at a time.
-pub fn albums(s: &Settings, p: Pass) -> Done {
+/// `only`: limit the first round to these albums (an import); albums approved meanwhile still join.
+pub fn albums(s: &Settings, p: Pass, only: Option<&[String]>) -> Done {
     let c = db::open();
     let mut dirs = album_dirs(&c, s, p);
+    if let Some(only) = only {
+        dirs.retain(|d| only.contains(d));
+    }
     job::phase("albums", dirs.len() as u64);
     let mut seen = std::collections::HashSet::new();
     let mut done = Done::default();
@@ -265,6 +269,39 @@ pub fn rules_everywhere(s: &Settings) -> usize {
                 let mut new = BTreeMap::new();
                 matcher::apply_rules(t, &mut new, s, &rules);
                 let wrote = write_with_undo(c, t, &new, None).map_err(|e| eprintln!("{}: {e}", t.path)).unwrap_or(false);
+                job::tick();
+                wrote as usize
+            })
+            .sum()
+    })
+}
+
+/// Health → disc numbers: write `health::disc_changes` for these albums (None = every album that has some).
+pub fn fix_discs(s: &Settings, dirs: Option<&[String]>) -> usize {
+    let c = db::open();
+    let tracks = match dirs {
+        Some(d) => db::tracks_where(&c, "dir IN (SELECT value FROM json_each(?1))", [serde_json::to_string(d).unwrap()]),
+        None => db::tracks_where(&c, "1", []),
+    };
+    let mut albums: BTreeMap<&str, Vec<&Track>> = BTreeMap::new();
+    for t in &tracks {
+        albums.entry(&t.dir).or_default().push(t);
+    }
+    let mut work: Vec<(&Track, BTreeMap<String, String>)> = vec![];
+    for (dir, ts) in &albums {
+        let mut fixes = crate::health::disc_changes(dir, ts.iter().map(|t| (t.id, t.path.as_str(), &t.tags)));
+        for t in ts {
+            if let Some(mut set) = fixes.remove(&t.id) {
+                set.retain(|k, _| s.writable(k)); // "Never overwrite" still holds
+                work.push((t, set));
+            }
+        }
+    }
+    job::phase("disc numbers", work.len() as u64);
+    s.io_pool().install(|| {
+        work.par_iter()
+            .map_init(db::open, |c, (t, set)| {
+                let wrote = write_with_undo(c, t, set, None).map_err(|e| eprintln!("{}: {e}", t.path)).unwrap_or(false);
                 job::tick();
                 wrote as usize
             })

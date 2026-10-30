@@ -10,10 +10,16 @@ xmusic works per album, and an album is the set of tracks in one folder. Disc su
 
 1. **Which albums.** A full run only matches albums that have no MusicBrainz or Discogs release id. Albums that already have
    a pending proposal, or that you ignored, are skipped.
-2. **Candidates.** MusicBrainz is searched with the album's artist and title tags. If the tags are too poor and
-   an AcoustID key is set, xmusic fingerprints up to three tracks with `fpcalc` and looks the recordings up.
-   If still nothing reaches the match threshold, Discogs is searched too (see below).
-3. **Scoring.** Each candidate gets a confidence from 0 to 1 based on how well artist, album title, track count
+2. **Candidates.** Exact identifiers come first, then fuzzier sources, each only while nothing is good yet:
+   - a `BARCODE` tag finds the exact pressing on MusicBrainz;
+   - the album's artist and title tags are searched;
+   - up to three tracks' `ISRC` tags find the releases holding those recordings;
+   - with an AcoustID key, up to three tracks are fingerprinted with `fpcalc`;
+   - finally Discogs (by barcode when there is one, else by artist and title; see below).
+3. **Scoring.** A track whose `ISRC` or fingerprint names a release track's recording is matched for certain,
+   and so is a track at the right position and length on a release with the same barcode; those also lift the
+   album's confidence even when its titles are junk. Otherwise each candidate gets a confidence from 0 to 1
+   based on how well artist, album title, track count
    and track titles/lengths line up. Releases from your preferred countries and media (`XW`, `US`; Digital
    Media, CD by default) win ties.
 4. **Track alignment.** Local files are matched to release tracks, so a file named `track 2` gets the right title
@@ -74,12 +80,14 @@ applied.
 ## Which tags are written
 
 Only the fields in **Write fields** (default `TITLE, ARTIST, ALBUM, ALBUMARTIST, DATE, ORIGINALDATE, TRACKNUMBER,
-TRACKTOTAL, DISCNUMBER, DISCTOTAL, GENRE, LABEL, CATALOGNUMBER, MUSICBRAINZ_*, DISCOGS_*`) are changed, and fields in **Preserve fields** (`COMMENT`,
+TRACKTOTAL, DISCNUMBER, DISCTOTAL, GENRE, LABEL, CATALOGNUMBER, BARCODE, MUSICBRAINZ_*, DISCOGS_*`) are changed, and fields in **Preserve fields** (`COMMENT`,
 `REPLAYGAIN_*`) are never overwritten. Patterns end in `*`.
 
 - `GENRE` is the release's most voted MusicBrainz genre, or its release group's when the release has none.
 - `ORIGINALDATE` is the release group's first release date; `DATE` is this release's date.
 - `LABEL` and `CATALOGNUMBER` come from the release's first label entry.
+- `BARCODE` is the release's, so a later re-match is exact. `ISRC` is never written: a recording can have
+  several, and the file's own value is kept.
 
 Albums applied before these fields existed get them with a **Re-match**.
 

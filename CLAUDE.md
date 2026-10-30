@@ -20,7 +20,8 @@ Self-hosted music metadata fixer: a Rust binary that serves a web dashboard (dai
 - `job.rs`: the single background job, phases, progress/ETA, cron scheduler, notifications (linking to `public_url`), and the Navidrome rescan after any job that changed files.
 - `watch.rs`: watch mode. inotify on enabled libraries, 30 s debounce, then a scan or full run. `watch::reload()` after any library/settings change.
 - `metrics.rs`: Prometheus text exposition for `GET /metrics`. Gauges are read from SQLite at scrape time, plus in-memory counters (`remote()`, `FILES_WRITTEN`, `FILES_RESTORED`).
-- `health.rs`: the library health report (`GET /api/health`), computed from the tracks table only.
+- `artist.rs`: artist images (`artist.jpg`, Wikidata → Commons via the MusicBrainz artist), saved next to the albums like cover.jpg.
+- `health.rs`: the library health report (`GET /api/health`), computed from the tracks table only. `disc_changes` is also what the disc-number fix job writes, so the report and the fix can't disagree.
 - `web.rs`: tiny_http routes and the JSON API, including the library browser, album detail, cover serving and duplicate finder.
 - `dashboard.html`: the whole UI (vanilla JS). `assets/` holds pinned daisyUI, Tailwind browser and Chart.js, compiled into the binary.
 
@@ -30,6 +31,7 @@ Self-hosted music metadata fixer: a Rust binary that serves a web dashboard (dai
 - `write_with_undo` skips files whose values already match, and updates the row via `scan::store` without re-reading the file. Every extra open costs on a network mount.
 - File I/O (scan reads, writes) runs in `Settings::io_pool()`, sized by `io_threads`. Don't use rayon's global pool for file work.
 - MusicBrainz is limited to 1 req/s by the global slot in `remote.rs`. Don't bypass it or parallelize MB calls. Discogs has its own slot (25/min without a token, 60 with).
+- Matching tries exact ids first: `BARCODE` (MusicBrainz search), then text, then `ISRC` (recording search, which lists releases; the ISRC lookup doesn't). In `matcher::score` an ISRC or fingerprint hit, or the right place and length on a same-barcode release, is proof. Barcodes compare with `matcher::same_barcode` (leading zeros ignored).
 - Discogs is a second source: `matcher::match_album` asks it only when nothing scores above `match_threshold`. Its release ids are `discogs:<n>` (`matcher::DISCOGS`); a Discogs match writes `DISCOGS_RELEASE_ID` and never `MUSICBRAINZ_*`. "Has a release id" means either one: use `db::HAS_RELEASE` in SQL.
 - Jobs never wait for a human. Low-confidence albums become `review`/`manual` proposals and are reported when the run ends.
 - Settings, libraries and users are admin-only (`web.rs` has an `admin_only` guard arm; user routes go above it).
@@ -43,6 +45,7 @@ Self-hosted music metadata fixer: a Rust binary that serves a web dashboard (dai
 - xmusic never deletes music files. "Keep this copy" in the duplicate finder moves the other copies with `apply::trash` to `<library>/.xmusic-trash/` (same relative path, logged in the `trash` table). `apply::restore` moves them back. Scans skip that folder, and emptying it is left to the user.
 - Duplicate groups include the disc set in their key, so `Disc 1 X` and `Disc 2 X` folders are halves of one album, not copies.
 - Cancelling a job (`job::cancel`) unwinds it at its next `job::tick()` or `job::check()` (a cancel point that doesn't count an item; the album pass checks between files). Never call either in the middle of a file write or a DB transaction you need to keep.
+- `POST /api/hook/import` is the only other public route: the `hook_token` in its URL is its login (empty = off). It feeds `job::import`, which queues album folders while another job runs; `Kind::Import` is a full run limited to them (`scan::run_in`, which prunes only inside the walked folders).
 - `/metrics` is public (no session) on purpose, so Prometheus can scrape it. Labels may hold library names, formats, statuses and job kinds, never file paths or tag values.
 - Every outbound HTTP call in `remote.rs` goes through `counted(service, ...)` so it shows up in `xmusic_remote_requests_total`.
 - Everything inserted into the dashboard with `innerHTML` goes through `esc()`, because tag values are untrusted.

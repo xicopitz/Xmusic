@@ -28,7 +28,7 @@ touches files.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| Write fields | `TITLE, ARTIST, ALBUM, ALBUMARTIST, DATE, ORIGINALDATE, TRACKNUMBER, TRACKTOTAL, DISCNUMBER, DISCTOTAL, GENRE, LABEL, CATALOGNUMBER, MUSICBRAINZ_*, DISCOGS_*` | Fields xmusic may change. A trailing `*` is a prefix |
+| Write fields | `TITLE, ARTIST, ALBUM, ALBUMARTIST, DATE, ORIGINALDATE, TRACKNUMBER, TRACKTOTAL, DISCNUMBER, DISCTOTAL, GENRE, LABEL, CATALOGNUMBER, BARCODE, MUSICBRAINZ_*, DISCOGS_*` | Fields xmusic may change. A trailing `*` is a prefix |
 | Preserve fields | `COMMENT, REPLAYGAIN_*` | Never overwritten |
 | Preferred countries | `XW, US` | Tie-breaker between releases |
 | Preferred media | `Digital Media, CD` | Tie-breaker between releases |
@@ -43,6 +43,7 @@ touches files.
 | Save cover.jpg next to the tracks | off |
 | Cover size | 1200 (`250`, `500`, `1200`, `original`) |
 | Upgrade covers smaller than (px) | 500 (0 = never) |
+| Save artist.jpg during full runs | off |
 | Shrink covers larger than (px) | 0 (never) |
 | Lyrics lookup | on |
 | Prefer synced lyrics | on |
@@ -59,8 +60,9 @@ Details: [Covers and lyrics](covers-and-lyrics.md).
 | Notify when finished / needs review / failed | Each on by default |
 | Public URL | Dashboard address as seen from your phone; notifications link to it |
 | Navidrome URL, user, password | Rescan after xmusic changes files. Empty = off |
+| Hook token | Enables the [Lidarr import hook](jobs-and-automation.md#import-hook-lidarr). Empty = off |
 
-The AcoustID key, Discogs token, Gotify token and Navidrome password are secrets: the dashboard shows them masked and never
+The AcoustID key, Discogs token, Gotify token, Navidrome password and hook token are secrets: the dashboard shows them masked and never
 receives the stored value. Leave the mask to keep a secret, type a new one to replace it, or clear the field to
 remove it.
 

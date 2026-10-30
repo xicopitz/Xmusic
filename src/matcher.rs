@@ -24,6 +24,8 @@ pub struct RelTrack {
     pub id: String,
     pub artist: String,
     pub artist_id: String,
+    /// normalised (`isrc`); MusicBrainz only
+    pub isrcs: Vec<String>,
 }
 
 #[derive(Default, Clone)]
@@ -41,7 +43,25 @@ pub struct Release {
     pub catalog: String,
     /// first release date of the release group
     pub original_date: String,
+    /// digits only, as printed (leading zeros kept); empty when unknown
+    pub barcode: String,
     pub tracks: Vec<RelTrack>,
+}
+
+/// A barcode's digits ("0 75596-09121 2" → "075596091212").
+pub fn digits(s: &str) -> String {
+    s.chars().filter(char::is_ascii_digit).collect()
+}
+
+/// Barcodes compare without leading zeros, so a 12-digit UPC equals its 13-digit EAN form.
+pub fn same_barcode(a: &str, b: &str) -> bool {
+    let key = |s: &str| digits(s).trim_start_matches('0').to_string();
+    !key(a).is_empty() && key(a) == key(b)
+}
+
+/// ISRC uppercased, without dashes or spaces ("us-abc-12-34567" → "USABC1234567").
+pub fn isrc(s: &str) -> String {
+    s.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_uppercase()).collect()
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -93,6 +113,7 @@ pub fn parse_release(v: &Value) -> Release {
                 id: s(&t["id"]),
                 artist: if ta.is_empty() { artist.clone() } else { ta },
                 artist_id: if taid.is_empty() { artist_id.clone() } else { taid },
+                isrcs: t["recording"]["isrcs"].as_array().into_iter().flatten().filter_map(|i| i.as_str().map(isrc)).collect(),
             });
         }
     }
@@ -113,6 +134,7 @@ pub fn parse_release(v: &Value) -> Release {
         label: s(&li["label"]["name"]),
         catalog: Some(s(&li["catalog-number"])).filter(|c| c != "[none]").unwrap_or_default(),
         original_date: s(&v["release-group"]["first-release-date"]),
+        barcode: digits(&s(&v["barcode"])),
         tracks,
     }
 }
@@ -179,6 +201,7 @@ pub fn parse_discogs(v: &Value) -> Release {
                 id: String::new(),
                 artist: if ta.is_empty() { artist.clone() } else { ta },
                 artist_id: String::new(),
+                isrcs: vec![],
             }
         })
         .collect();
@@ -197,6 +220,7 @@ pub fn parse_discogs(v: &Value) -> Release {
         label: discogs_name(label["name"].as_str().unwrap_or_default()).to_string(),
         catalog: Some(s(&label["catno"])).filter(|c| !c.eq_ignore_ascii_case("none")).unwrap_or_default(),
         original_date: String::new(),
+        barcode: v["identifiers"].as_array().into_iter().flatten().find(|i| i["type"] == "Barcode").map(|i| digits(&s(&i["value"]))).unwrap_or_default(),
         tracks,
     }
 }
@@ -239,15 +263,20 @@ pub fn majority<'a>(tracks: &'a [Track], key: &str) -> &'a str {
 pub fn score(local: &[Track], rel: &Release, fp: &[Vec<String>], s: &Settings) -> (f64, Vec<Option<usize>>) {
     let (nl, nr) = (local.len(), rel.tracks.len());
     let mut pairs = vec![];
+    let mut isrc_hits = false;
+    let same_code = same_barcode(majority(local, "BARCODE"), &rel.barcode);
     for (i, t) in local.iter().enumerate() {
         for (j, r) in rel.tracks.iter().enumerate() {
-            let sc = if fp.get(i).is_some_and(|f| f.contains(&r.recording)) {
+            let isrc_hit = t.tags.get("ISRC").is_some_and(|x| r.isrcs.contains(&isrc(x)));
+            isrc_hits |= isrc_hit;
+            let d = (t.duration - r.length).abs();
+            let pos_hit = num(t.tags.get("TRACKNUMBER")) == Some(r.pos) && disc(t) == r.disc;
+            // proof: a fingerprint or ISRC naming this recording, or (same barcode) the right place and length
+            let sc = if isrc_hit || fp.get(i).is_some_and(|f| f.contains(&r.recording)) || (same_code && pos_hit && r.length > 0.0 && d <= 3.0) {
                 1.0
             } else {
                 let title = t.tags.get("TITLE").map_or(0.0, |x| sim(x, &r.title));
-                let d = (t.duration - r.length).abs();
                 let dur = if r.length == 0.0 { 0.5 } else if d <= 3.0 { 1.0 } else { (1.0 - (d - 3.0) / 10.0).max(0.0) };
-                let pos_hit = num(t.tags.get("TRACKNUMBER")) == Some(r.pos) && disc(t) == r.disc;
                 (0.6 * title + 0.4 * dur + if pos_hit { 0.2 } else { 0.0 }).min(1.0)
             };
             if sc > 0.3 {
@@ -274,7 +303,8 @@ pub fn score(local: &[Track], rel: &Release, fp: &[Vec<String>], s: &Settings) -
         &rel.artist,
     );
     let mut conf = 0.25 * album + 0.15 * artist + 0.15 * count + 0.45 * align;
-    if fp.iter().any(|f| !f.is_empty()) {
+    // fingerprints, ISRCs or the same barcode identify the release even when the tags are junk
+    if isrc_hits || same_code || fp.iter().any(|f| !f.is_empty()) {
         conf = conf.max(0.2 * count + 0.8 * align);
     }
     if s.prefer_country.iter().any(|c| c.eq_ignore_ascii_case(&rel.country)) {
@@ -342,6 +372,7 @@ pub fn changes(local: &[Track], rel: &Release, assign: &[Option<usize>], s: &Set
             put("ORIGINALDATE", rel.original_date.clone());
             put("LABEL", rel.label.clone());
             put("CATALOGNUMBER", rel.catalog.clone());
+            put("BARCODE", rel.barcode.clone());
             put("TRACKNUMBER", r.pos.to_string());
             put("TRACKTOTAL", r.track_total.to_string());
             put("DISCNUMBER", r.disc.to_string());
@@ -379,32 +410,54 @@ fn cand(r: &Release, score: f64) -> Cand {
     }
 }
 
-/// Full match for one album directory. Network-bound (~1 req/s).
+/// Fetch up to 3 of `ids` not already in `rels` (MBIDs or `discogs:<n>`). True once one scores `good`
+/// with every track aligned: each lookup costs a second or more of quota, so the caller stops there.
+fn take(local: &[Track], ids: impl IntoIterator<Item = String>, rels: &mut Vec<Release>, notes: &mut Vec<String>, fp: &[Vec<String>], good: f64, s: &Settings) -> bool {
+    let ids: Vec<String> = ids.into_iter().filter(|id| !rels.iter().any(|r| &r.id == id)).take(3).collect();
+    for id in ids {
+        match fetch_release(s, &id) {
+            Ok(r) => {
+                let (sc, assign) = score(local, &r, fp, s);
+                rels.push(r);
+                if sc >= good && assign.iter().all(Option::is_some) {
+                    return true;
+                }
+            }
+            Err(e) => notes.push(e),
+        }
+    }
+    false
+}
+
+/// Release ids by votes, most first; `ties` breaks equal votes (smaller is better).
+fn ranked(votes: HashMap<String, (usize, u64)>) -> Vec<String> {
+    let mut top: Vec<_> = votes.into_iter().collect();
+    top.sort_by_key(|(_, (n, ties))| (std::cmp::Reverse(*n), *ties));
+    top.into_iter().map(|(id, _)| id).collect()
+}
+
+/// Full match for one album directory. Network-bound (~1 req/s). Sources in order, each only while
+/// nothing is good yet: barcode, text search, the album's own release, ISRCs, fingerprints, Discogs.
 pub fn match_album(local: &[Track], s: &Settings) -> Proposal {
     let ua = &s.contact_email;
     let mut rels: Vec<Release> = vec![];
     let mut notes = vec![];
     let album = majority(local, "ALBUM");
     let artist = Some(majority(local, "ALBUMARTIST")).filter(|a| !a.is_empty()).unwrap_or(majority(local, "ARTIST"));
-    if !album.is_empty() {
+    let code = digits(majority(local, "BARCODE"));
+    let good = if s.auto_apply_above > 0.0 { s.auto_apply_above } else { 0.95 };
+    let mut done = false;
+
+    // a barcode names the exact pressing
+    if !code.is_empty() {
+        match remote::search_barcode(ua, &code) {
+            Ok(ids) => done = take(local, ids, &mut rels, &mut notes, &[], good, s),
+            Err(e) => notes.push(e),
+        }
+    }
+    if !done && !album.is_empty() {
         match remote::search_releases(ua, artist, album, local.len()) {
-            Ok(ids) => {
-                // each lookup costs ~1.1 s of MusicBrainz quota: stop once one is clearly right
-                let good = if s.auto_apply_above > 0.0 { s.auto_apply_above } else { 0.95 };
-                for id in ids.iter().take(3) {
-                    match remote::release(ua, id) {
-                        Ok(v) => {
-                            let r = parse_release(&v);
-                            let (sc, assign) = score(local, &r, &[], s);
-                            rels.push(r);
-                            if sc >= good && assign.iter().all(Option::is_some) {
-                                break;
-                            }
-                        }
-                        Err(e) => notes.push(e),
-                    }
-                }
-            }
+            Ok(ids) => done = take(local, ids, &mut rels, &mut notes, &[], good, s),
             Err(e) => notes.push(e),
         }
     }
@@ -412,18 +465,33 @@ pub fn match_album(local: &[Track], s: &Settings) -> Proposal {
     let own = Some(majority(local, "MUSICBRAINZ_ALBUMID").to_string())
         .filter(|o| !o.is_empty())
         .or_else(|| Some(majority(local, "DISCOGS_RELEASE_ID")).filter(|o| !o.is_empty()).map(|o| format!("{DISCOGS}{o}")));
-    if let Some(own) = own.filter(|o| !rels.iter().any(|r| &r.id == o)) {
-        match fetch_release(s, &own) {
-            Ok(r) => rels.push(r),
-            Err(e) => notes.push(e),
-        }
+    if let Some(own) = own {
+        take(local, [own], &mut rels, &mut notes, &[], good, s);
     }
-    let none: Vec<Vec<String>> = vec![];
     let best = |rels: &[Release], fp: &[Vec<String>]| rels.iter().map(|r| score(local, r, fp, s).0).fold(0.0, f64::max);
 
-    let mut fp = none.clone();
+    // ISRCs: the releases holding these recordings; the one with every track and the right length wins
+    let isrcs: Vec<String> = local.iter().filter_map(|t| t.tags.get("ISRC")).map(|x| isrc(x)).filter(|x| !x.is_empty()).take(3).collect();
+    if !done && !isrcs.is_empty() && best(&rels, &[]) < s.match_threshold {
+        let mut votes: HashMap<String, (usize, u64)> = HashMap::new();
+        for code in &isrcs {
+            match remote::isrc_releases(ua, code) {
+                Ok(found) => {
+                    for (id, n) in found {
+                        let v = votes.entry(id).or_default();
+                        v.0 += 1;
+                        v.1 = n.abs_diff(local.len() as u64);
+                    }
+                }
+                Err(e) => notes.push(e),
+            }
+        }
+        take(local, ranked(votes), &mut rels, &mut notes, &[], good, s);
+    }
+
+    let mut fp: Vec<Vec<String>> = vec![];
     if best(&rels, &fp) < s.match_threshold && !s.acoustid_key.is_empty() {
-        let mut votes: HashMap<String, usize> = HashMap::new();
+        let mut votes: HashMap<String, (usize, u64)> = HashMap::new();
         // 3 tracks' votes find the release; fpcalc decodes audio, so each one costs CPU and a read over the mount
         for t in local.iter().take(3) {
             let mut recs = vec![];
@@ -433,7 +501,7 @@ pub fn match_album(local: &[Track], s: &Settings) -> Proposal {
                         for (_, rec, releases) in hits.into_iter().filter(|h| h.0 > 0.5) {
                             recs.push(rec);
                             for r in releases {
-                                *votes.entry(r).or_default() += 1;
+                                votes.entry(r).or_default().0 += 1;
                             }
                         }
                     }
@@ -445,34 +513,20 @@ pub fn match_album(local: &[Track], s: &Settings) -> Proposal {
             }
             fp.push(recs);
         }
-        let mut top: Vec<_> = votes.into_iter().collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1));
-        let fresh: Vec<String> = top.into_iter().map(|(id, _)| id).filter(|id| !rels.iter().any(|r| &r.id == id)).take(3).collect();
-        for id in fresh {
-            match remote::release(ua, &id) {
-                Ok(v) => rels.push(parse_release(&v)),
-                Err(e) => notes.push(e),
-            }
-        }
+        take(local, ranked(votes), &mut rels, &mut notes, &fp, good, s);
     }
 
     // second source: Discogs has many pressings and small releases MusicBrainz lacks
-    if s.discogs_enabled && !album.is_empty() && best(&rels, &fp) < s.match_threshold {
-        match remote::discogs_search(ua, &s.discogs_token, artist, album, local.len()) {
+    if s.discogs_enabled && (!album.is_empty() || !code.is_empty()) && best(&rels, &fp) < s.match_threshold {
+        // by barcode when there is one, else (or when Discogs doesn't know it) by artist and album
+        let search = |code: &str| remote::discogs_search(ua, &s.discogs_token, artist, album, code, local.len());
+        let found = match search(&code) {
+            Ok(ids) if ids.is_empty() && !code.is_empty() && !album.is_empty() => search(""),
+            other => other,
+        };
+        match found {
             Ok(ids) => {
-                for id in ids.iter().take(3) {
-                    match remote::discogs_release(ua, &s.discogs_token, id) {
-                        Ok(v) => {
-                            let r = parse_discogs(&v);
-                            let (sc, assign) = score(local, &r, &fp, s);
-                            rels.push(r);
-                            if sc >= s.match_threshold && assign.iter().all(Option::is_some) {
-                                break;
-                            }
-                        }
-                        Err(e) => notes.push(e),
-                    }
-                }
+                take(local, ids.into_iter().map(|id| format!("{DISCOGS}{id}")), &mut rels, &mut notes, &fp, s.match_threshold, s);
             }
             Err(e) => notes.push(e),
         }
@@ -531,11 +585,12 @@ mod tests {
         let t = |pos, title: &str, length| RelTrack {
             disc: 1, pos, disc_total: 1, track_total: 2, title: title.into(), length,
             recording: format!("rec{pos}"), id: format!("t{pos}"), artist: "Miles Davis".into(), artist_id: "a1".into(),
+            isrcs: vec![format!("USX0059000{pos:02}")],
         };
         Release {
             id: "rel1".into(), title: "Kind of Blue".into(), artist: "Miles Davis".into(), artist_id: "a1".into(),
             date: "1959-08-17".into(), country: "US".into(), formats: vec!["CD".into()], rg_id: "rg1".into(),
-            genre: Some("jazz".into()), label: "Columbia".into(), catalog: "CL 1355".into(), original_date: "1959".into(),
+            genre: Some("jazz".into()), label: "Columbia".into(), catalog: "CL 1355".into(), original_date: "1959".into(), barcode: "074646493525".into(),
             tracks: vec![t(1, "So What", 562.0), t(2, "Freddie Freeloader", 586.0)],
         }
     }
@@ -608,6 +663,51 @@ mod tests {
         let fp = vec![vec!["rec1".to_string()], vec!["rec2".to_string()]];
         assert!(score(&local, &release(), &[], &s).0 < s.match_threshold);
         assert!(score(&local, &release(), &fp, &s).0 > 0.95);
+    }
+
+    #[test]
+    fn isrc_and_barcode_identify() {
+        let s = Settings::default();
+        assert_eq!(isrc("us-x00-59-0000 1"), "USX005900001");
+        assert!(same_barcode("0 74646-49352 5", "74646493525"), "UPC and EAN forms are one barcode");
+        assert!(!same_barcode("", "") && !same_barcode("123", "124"));
+
+        // junk titles and no lengths: text alone can't place these tracks
+        let junk = |tags: &[(&str, &str)]| -> Vec<Track> {
+            (1..=2)
+                .map(|i| {
+                    let mut t = track(i, "x", 0, 0.0);
+                    t.tags.clear();
+                    for (k, v) in tags {
+                        t.tags.insert(k.to_string(), v.replace('#', &i.to_string()));
+                    }
+                    t
+                })
+                .collect()
+        };
+        assert!(score(&junk(&[]), &release(), &[], &s).0 < s.match_threshold);
+        // per track: an ISRC the release lists is proof, like a fingerprint
+        let (conf, assign) = score(&junk(&[("ISRC", "usx00-590-000#")]), &release(), &[], &s);
+        assert_eq!(assign, vec![Some(0), Some(1)]);
+        assert!(conf > 0.95, "conf {conf}");
+        // per release: the same barcode vouches for it once the tracks line up, even without album or artist tags
+        let titled = |code: Option<&str>| -> Vec<Track> {
+            [(1, "So What", 562.0), (2, "Freddie Freeloader", 586.0)]
+                .into_iter()
+                .map(|(i, title, dur)| {
+                    let mut t = track(i, title, i as usize, dur);
+                    t.tags.retain(|k, _| k == "TITLE" || k == "TRACKNUMBER");
+                    if let Some(c) = code {
+                        t.tags.insert("BARCODE".into(), c.into());
+                    }
+                    t
+                })
+                .collect()
+        };
+        let plain = score(&titled(None), &release(), &[], &s).0;
+        let coded = score(&titled(Some("0074646493525")), &release(), &[], &s).0;
+        assert!(plain < s.match_threshold && coded > 0.95, "plain {plain}, coded {coded}");
+        assert_eq!(changes(&titled(None), &release(), &assign, &s)[&1]["BARCODE"], "074646493525");
     }
 
     #[test]
