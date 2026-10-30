@@ -17,7 +17,7 @@ Self-hosted music metadata fixer: a Rust binary that serves a web dashboard (dai
 - `remote.rs`: all HTTP calls (MusicBrainz, Discogs, AcoustID, CAA, LRCLIB, Gotify, Navidrome `startScan`).
 - `matcher.rs`: candidate scoring, track alignment, building proposals, custom tags and rewrite rules.
 - `apply.rs`: every file write (`write_with_undo`). The album pass (`albums`) fetches covers and lyrics per album, then writes each track once. `Pass` picks which parts run (full run: all; the Jobs page can run covers or lyrics alone). Also undo and trash.
-- `job.rs`: the single background job, phases, progress/ETA, cron scheduler, notifications (linking to `public_url`), and the Navidrome rescan after any job that changed files.
+- `job.rs`: background jobs (up to `max_jobs` at once; the current job is a thread-local that `Settings::io_pool()` hands to its workers), phases, progress/ETA, cron scheduler, notifications (linking to `public_url`), and the Navidrome rescan after any job that changed files.
 - `watch.rs`: watch mode. inotify on enabled libraries, 30 s debounce, then a scan or full run. `watch::reload()` after any library/settings change.
 - `metrics.rs`: Prometheus text exposition for `GET /metrics`. Gauges are read from SQLite at scrape time, plus in-memory counters (`remote()`, `FILES_WRITTEN`, `FILES_RESTORED`).
 - `artist.rs`: artist images (`artist.jpg`, Wikidata → Commons via the MusicBrainz artist), saved next to the albums like cover.jpg.
@@ -27,7 +27,7 @@ Self-hosted music metadata fixer: a Rust binary that serves a web dashboard (dai
 
 ## Invariants
 - Never write to a music file except through `apply::write_with_undo`, which logs the original values first, and only for approved proposals, auto-approved ones, or explicit rule/cover/lyrics jobs.
-- A run writes each file at most once: `apply::albums` gathers approved tags, the cover and lyrics, then makes one `write_with_undo` per track. Don't add a pass that writes files on its own. On rclone and SMB mounts every write re-uploads the whole file, and lofty rewrites the whole FLAC anyway.
+- A run writes each file at most once: `apply::albums` gathers approved tags, the cover and lyrics, then makes one `write_with_undo` per track. Don't add a pass that writes files on its own. On network mounts (rclone, SMB) every write re-uploads the whole file, and lofty rewrites the whole FLAC anyway.
 - `write_with_undo` skips files whose values already match, and updates the row via `scan::store` without re-reading the file. Every extra open costs on a network mount.
 - File I/O (scan reads, writes) runs in `Settings::io_pool()`, sized by `io_threads`. Don't use rayon's global pool for file work.
 - MusicBrainz is limited to 1 req/s by the global slot in `remote.rs`. Don't bypass it or parallelize MB calls. Discogs has its own slot (25/min without a token, 60 with).
@@ -44,7 +44,8 @@ Self-hosted music metadata fixer: a Rust binary that serves a web dashboard (dai
 - Schema changes go in `db::migrate`, keyed on `PRAGMA user_version`. Never edit `SCHEMA` for an existing table.
 - xmusic never deletes music files. "Keep this copy" in the duplicate finder moves the other copies with `apply::trash` to `<library>/.xmusic-trash/` (same relative path, logged in the `trash` table). `apply::restore` moves them back. Scans skip that folder, and emptying it is left to the user.
 - Duplicate groups include the disc set in their key, so `Disc 1 X` and `Disc 2 X` folders are halves of one album, not copies.
-- Cancelling a job (`job::cancel`) unwinds it at its next `job::tick()` or `job::check()` (a cancel point that doesn't count an item; the album pass checks between files). Never call either in the middle of a file write or a DB transaction you need to keep.
+- Jobs may run in parallel. Every music-file write and scan read holds `apply::lock_file(path)` (one at a time, never wait on anything while holding it), and `job::start` refuses a job whose `Kind` (with its arguments) is already running. Threads outside the io pool don't know their job: spawn file work only through `Settings::io_pool()`.
+- Cancelling a job (`job::cancel(id)`) unwinds it at its next `job::tick()` or `job::check()` (a cancel point that doesn't count an item; the album pass checks between files). Never call either in the middle of a file write or a DB transaction you need to keep.
 - `POST /api/hook/import` is the only other public route: the `hook_token` in its URL is its login (empty = off). It feeds `job::import`, which queues album folders while another job runs; `Kind::Import` is a full run limited to them (`scan::run_in`, which prunes only inside the walked folders).
 - `/metrics` is public (no session) on purpose, so Prometheus can scrape it. Labels may hold library names, formats, statuses and job kinds, never file paths or tag values.
 - Every outbound HTTP call in `remote.rs` goes through `counted(service, ...)` so it shows up in `xmusic_remote_requests_total`.

@@ -21,7 +21,7 @@ people who keep their music on a NAS or a home server.
   a trash folder you can restore from.
 - **Is safe.** Every change is logged first and can be undone. xmusic never deletes music files.
 - **Is light.** Each file is written at most once per run, file work is bounded by a setting, and MusicBrainz
-  is queried at 1 request per second. It is tuned for rclone and SMB mounts.
+  is queried at 1 request per second. It works on local disks and is gentle on network mounts (NFS, SMB, rclone).
 - **Runs unattended.** Cron schedule, watch mode, a Lidarr import hook, Gotify notifications and a Navidrome
   rescan after changes. The database can be backed up and restored from the dashboard.
   Prometheus metrics and a Grafana dashboard are included.
@@ -50,7 +50,7 @@ Without Docker: `cargo run --release` (needs Rust; `ffmpeg` only for the test su
 | [Duplicates](docs/duplicates.md) | Finding duplicates, keeping one copy, restoring |
 | [Jobs and automation](docs/jobs-and-automation.md) | Job kinds, schedule, watch mode, cancel, notifications, Navidrome |
 | [Settings reference](docs/settings.md) | Every setting and its default |
-| [Network mounts](docs/network-mounts.md) | rclone / SMB tuning and CPU limits |
+| [Network mounts](docs/network-mounts.md) | Tuning for NFS, SMB and rclone mounts, and CPU limits |
 | [Safety and undo](docs/safety.md) | What xmusic writes, how undo and trash work |
 | [Monitoring](docs/monitoring.md) | Prometheus metrics and the Grafana dashboard |
 | [Development](docs/development.md) | Code layout, tests, building and deploying |

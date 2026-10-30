@@ -420,7 +420,8 @@ const pages = {
       <div data-pane="general" class="flex flex-col gap-4">
         ${sec('⏱️ Runs', '', `
           ${txt('schedule', 'Scan schedule (cron)', 'Standard 5-field cron, e.g. <code>0 3 * * *</code> = every day at 03:00 (container time zone). Empty = no scheduled runs.')}
-          ${txt('io_threads', 'Parallel file operations', 'How many files are read or written at once. Lower is lighter on the NUC and on a network mount (rclone, SMB).', 'number', 'min="1" max="16"')}
+          ${txt('io_threads', 'Parallel file operations', 'How many files are read or written at once. Lower is lighter on the machine running xmusic and on a network mount (rclone, SMB).', 'number', 'min="1" max="16"')}
+      ${txt('max_jobs', 'Max parallel jobs', 'Jobs that may run at once. 1 = one after another. Higher lets small jobs (album fetches, re-match, Lidarr imports) run beside a long one; the same job never runs twice, two jobs never write one file at once, and MusicBrainz stays at 1 request/s for all of them. Each job uses up to the parallel file operations above.', 'number', 'min="1" max="8"')}
           <div class="flex flex-col gap-2 md:col-span-2"><span class="text-sm font-medium">Watch mode</span>
             ${chk('watch_enabled', 'Scan automatically when files in a library change')}
             ${chk('watch_full_run', 'After changes, do a full run (match + apply) instead of a scan only')}
@@ -477,14 +478,14 @@ const pages = {
           ${txt('gotify_token', 'Application token', '', 'password')}
           ${txt('gotify_priority', 'Priority', '', 'number', 'min="0" max="10"')}
           <div class="flex flex-col gap-2">${chk('notify_finished', 'When a run finishes')}${chk('notify_review', 'When albums need review')}${chk('notify_error', 'When a job fails')}</div>
-          ${txt('public_url', 'Dashboard address', 'How you open xmusic, e.g. http://192.168.1.73:8337. Tapping a notification opens the Review or Jobs page there.')}
+          ${txt('public_url', 'Dashboard address', 'How you open xmusic, e.g. http://myserver:8337. Tapping a notification opens the Review or Jobs page there.')}
           <div class="md:pt-7"><button class="btn" id="notify-test">Send test notification</button><p class="text-xs opacity-70 mt-1">Uses the saved settings, so save first.</p></div>`)}
         ${sec('🎧 Navidrome', 'After a job changes files, xmusic asks Navidrome (or any Subsonic server) to rescan, so fixes show up right away. Leave the URL empty to turn it off.', `
-          ${txt('navidrome_url', 'URL', 'e.g. http://192.168.1.73:4533')}
+          ${txt('navidrome_url', 'URL', 'e.g. http://myserver:4533')}
           ${txt('navidrome_user', 'User', 'A Navidrome admin: only admins can start a scan.')}
           ${txt('navidrome_password', 'Password', '', 'password')}
           <div class="md:pt-7"><button class="btn" id="navidrome-test">Start a Navidrome scan</button><p class="text-xs opacity-70 mt-1">Uses the saved settings, so save first.</p></div>`)}
-        ${sec('📥 Lidarr', 'Import hook: when Lidarr imports an album, xmusic scans, matches and finishes just that album (cover, lyrics) right away, instead of at the next scheduled run. Network mounts like rclone never tell watch mode about new files, so this is how they get noticed. Empty token = off.', `
+        ${sec('📥 Lidarr', 'Import hook: when Lidarr imports an album, xmusic scans, matches and finishes just that album (cover, lyrics) right away, instead of at the next scheduled run. Network mounts (NFS, SMB, rclone) never tell watch mode about new files, so this is how they get noticed. Empty token = off.', `
           ${txt('hook_token', 'Hook token', 'The hook URL carries it. Saved tokens stay hidden: generate a new one to see the URL again.', 'password', 'autocomplete="off"')}
           <div class="flex flex-col gap-1 md:pt-7"><button class="btn w-fit" id="hook-gen">Generate token</button><div id="hook-url" class="text-xs break-all"></div></div>`)}
       </div>
@@ -865,15 +866,18 @@ async function browseFolders(start, onPick) {
 
 /* ---------- job polling ---------- */
 let LAST_JOB = null;
-function renderJob(j) {
+function renderJob(st) {
   const el = $('#job-card');
-  if (!el || !j) return;
-  if (!j.running) {
-    el.innerHTML = `<div class="alert"><span>No job running.${j.last ? ` Last: ${esc(j.last)}` : ''}</span></div>`;
+  if (!el || !st) return;
+  if (!st.running) {
+    el.innerHTML = `<div class="alert"><span>No job running.${st.last ? ` Last: ${esc(st.last)}` : ''}</span></div>`;
     return;
   }
+  el.innerHTML = `<div class="flex flex-col gap-4">${st.jobs.map(jobCard).join('')}</div>`;
+}
+function jobCard(j) {
   const p = j.total ? pct(j.done, j.total) : null;
-  el.innerHTML = card(`Running: ${esc(j.kind)}`, `
+  return card(`Running: ${esc(j.kind)}`, `
     <div>${cancelBtn(j, 'btn-sm btn-error btn-outline', 'Cancel job')}</div>
     <div class="flex justify-between text-sm"><span>Phase: <b>${esc(j.phase)}</b> ${j.total ? `(${j.done.toLocaleString()} / ${j.total.toLocaleString()})` : ''}</span><span>started ${when(j.started)}</span></div>
     ${p === null ? '<progress class="progress progress-primary w-full"></progress>' : `<progress class="progress progress-primary w-full" value="${p}" max="100"></progress>`}
@@ -884,39 +888,45 @@ function renderJob(j) {
     <ul class="steps steps-vertical sm:steps-horizontal text-xs w-full">${j.finished.map(([n, t]) => `<li class="step step-primary" data-content="✓">${esc(n)} · ${dur(t)}</li>`).join('')}<li class="step step-primary step-now font-semibold" data-content="●">${esc(j.phase)}${j.total ? ` (${j.done.toLocaleString()} / ${j.total.toLocaleString()})` : ''}</li>${j.upcoming.map(([n, c]) => `<li class="step">${esc(n)}${c ? ` (${c.toLocaleString()})` : ''}</li>`).join('')}</ul>`);
 }
 async function poll() {
-  let j;
-  try { j = await api('GET', '/api/job') } catch { return }
-  $('#tasks-dot').classList.toggle('hidden', !j.running);
-  if (LAST_JOB?.running && !j.running) {
-    toast(j.last || 'Job finished', 'info'); route(); refreshBanner(); loadRecent();
+  let st;
+  try { st = await api('GET', '/api/job') } catch { return }
+  $('#tasks-dot').classList.toggle('hidden', !st.running);
+  // a job ended: one we saw last time is gone
+  if (LAST_JOB?.jobs.some(j => !st.jobs.some(n => n.id === j.id))) {
+    toast(st.last || 'Job finished', 'info'); route(); refreshBanner(); loadRecent();
     if (REMATCH_DIR) { const dir = REMATCH_DIR; REMATCH_DIR = null; showProposalFor(dir) }
   }
-  LAST_JOB = j;
-  renderJob(j);
+  LAST_JOB = st;
+  renderJob(st);
   renderTasks();
   renderRunbar();
 }
 
 // running-job indicators outside the Jobs page: sidebar badge + a bar on top of Overview
 function renderRunbar() {
-  const j = LAST_JOB, p = j?.total ? pct(j.done, j.total) : null;
-  $('#nav-jobs').textContent = p === null ? 'running' : p + '%';
-  $('#nav-jobs').classList.toggle('hidden', !j?.running);
-  const on = j?.running && (location.hash.slice(1) || 'overview') === 'overview';
-  $('#runbar').innerHTML = on ? `<div class="alert alert-info flex flex-wrap">
-      <span class="loading loading-spinner loading-sm"></span>
-      <div class="grow min-w-0"><div class="font-medium">${esc(j.kind)} · ${esc(j.phase)}${j.total ? ` (${j.done.toLocaleString()} / ${j.total.toLocaleString()})` : ''}</div>
-        <div class="text-xs">${j.eta != null ? '~' + dur(j.eta) + ' left' : 'estimating…'}</div>
-        ${p === null ? '' : `<progress class="progress w-full max-w-md" value="${p}" max="100"></progress>`}</div>
-      ${cancelBtn(j, 'btn-sm btn-ghost')}<a class="btn btn-sm" href="#jobs">Open job</a></div>` : '';
+  const jobs = LAST_JOB?.jobs || [], j = jobs[0], p = j?.total ? pct(j.done, j.total) : null;
+  $('#nav-jobs').textContent = (p === null ? 'running' : p + '%') + (jobs.length > 1 ? ` +${jobs.length - 1}` : '');
+  $('#nav-jobs').classList.toggle('hidden', !j);
+  const on = j && (location.hash.slice(1) || 'overview') === 'overview';
+  $('#runbar').innerHTML = on ? `<div class="alert alert-info flex flex-col items-stretch">${jobs.map(j => {
+      const p = j.total ? pct(j.done, j.total) : null;
+      return `<div class="flex flex-wrap items-center gap-3">
+        <span class="loading loading-spinner loading-sm"></span>
+        <div class="grow min-w-0"><div class="font-medium">${esc(j.kind)} · ${esc(j.phase)}${j.total ? ` (${j.done.toLocaleString()} / ${j.total.toLocaleString()})` : ''}</div>
+          <div class="text-xs">${j.eta != null ? '~' + dur(j.eta) + ' left' : 'estimating…'}</div>
+          ${p === null ? '' : `<progress class="progress w-full max-w-md" value="${p}" max="100"></progress>`}</div>
+        ${cancelBtn(j, 'btn-sm btn-ghost')}</div>`;
+    }).join('')}<a class="btn btn-sm self-end" href="#jobs">Open jobs</a></div>` : '';
 }
 // after a cancel the job still finishes the file it is writing, so say so instead of offering Cancel again
 function cancelBtn(j, cls, label = 'Cancel') {
-  return j.cancelling ? '<span class="badge badge-warning">Cancelling…</span>' : `<button class="btn ${cls}" data-cancel>${label}</button>`;
+  return j.cancelling ? '<span class="badge badge-warning">Cancelling…</span>' : `<button class="btn ${cls}" data-cancel="${j.id}">${label}</button>`;
 }
 document.addEventListener('click', e => {
-  if (!e.target.closest('[data-cancel]')) return;
-  guard(async () => { if (confirm(`Cancel "${LAST_JOB?.kind}"? It stops after the file it is writing; changes already written stay (undo still works).`)) { await post('/api/job/cancel'); toast('Cancelling…', 'info'); poll() } })();
+  const b = e.target.closest('[data-cancel]');
+  if (!b) return;
+  const id = +b.dataset.cancel, j = LAST_JOB?.jobs.find(j => j.id === id);
+  guard(async () => { if (confirm(`Cancel "${j?.kind}"? It stops after the file it is writing; changes already written stay (undo still works).`)) { await post('/api/job/cancel', { id }); toast('Cancelling…', 'info'); poll() } })();
 });
 
 /* ---------- tasks dropdown (clock icon) ---------- */
@@ -926,18 +936,20 @@ async function loadRecent() {
   renderTasks();
 }
 function renderTasks() {
-  const j = LAST_JOB, el = $('#tasks-body');
-  if (!el || !j) return;
-  const p = j.total ? pct(j.done, j.total) : null;
+  const st = LAST_JOB, el = $('#tasks-body');
+  if (!el || !st) return;
   el.innerHTML = `
     <h3 class="font-semibold text-sm">Running</h3>
-    ${j.running ? `<div class="flex flex-col gap-1">
+    ${st.jobs.map(j => {
+      const p = j.total ? pct(j.done, j.total) : null;
+      return `<div class="flex flex-col gap-1">
         <div class="flex justify-between text-sm gap-2"><span class="font-medium">${esc(j.kind)}</span><span class="opacity-70 shrink-0">${j.eta != null ? '~' + dur(j.eta) + ' left' : ''}</span></div>
         <div class="text-xs opacity-70">${esc(j.phase)}${j.total ? ` · ${j.done.toLocaleString()} / ${j.total.toLocaleString()}` : ''}</div>
         ${p === null ? '<progress class="progress progress-info w-full"></progress>' : `<progress class="progress progress-info w-full" value="${p}" max="100"></progress>`}
         ${j.upcoming.length ? `<div class="text-xs opacity-70">Next: ${j.upcoming.map(([n, c]) => `${esc(n)} (${c})`).join(' → ')}</div>` : ''}
         <div>${cancelBtn(j, 'btn-xs btn-error btn-outline w-fit')}</div>
-      </div>` : '<p class="text-sm opacity-70">Nothing running.</p>'}
+      </div>`;
+    }).join('') || '<p class="text-sm opacity-70">Nothing running.</p>'}
     <h3 class="font-semibold text-sm mt-1">Recent</h3>
     <ul class="flex flex-col gap-2">${RECENT.map(r => `<li class="text-xs">
         <div class="flex justify-between gap-2"><span class="font-medium text-sm">${esc(r.kind)}</span><span class="opacity-70 shrink-0">${when(r.finished)} · ${dur(r.finished - r.started)}</span></div>

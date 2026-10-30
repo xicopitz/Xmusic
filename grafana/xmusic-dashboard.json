@@ -1663,6 +1663,16 @@
                   "text": "Running"
                 }
               }
+            },
+            {
+              "type": "range",
+              "options": {
+                "from": 2,
+                "to": 8,
+                "result": {
+                  "text": "Several running"
+                }
+              }
             }
           ]
         },
@@ -1703,8 +1713,8 @@
             "uid": "${datasource}"
           },
           "refId": "A",
-          "expr": "xmusic_job_progress_ratio",
-          "legendFormat": "__auto"
+          "expr": "xmusic_job_progress_ratio or on() vector(0)",
+          "legendFormat": "{{kind}}"
         }
       ],
       "fieldConfig": {
@@ -1760,8 +1770,8 @@
             "uid": "${datasource}"
           },
           "refId": "A",
-          "expr": "xmusic_job_eta_seconds",
-          "legendFormat": "__auto"
+          "expr": "xmusic_job_eta_seconds or on() vector(0)",
+          "legendFormat": "{{kind}}"
         }
       ],
       "fieldConfig": {

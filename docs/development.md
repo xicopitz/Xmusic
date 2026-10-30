@@ -43,5 +43,5 @@ Schema changes go in `db::migrate`, keyed on `PRAGMA user_version`; never edit `
 ## Build and deploy to a home server
 
 `tools/build.sh` builds the image and pushes it to a registry; `tools/deploy.sh` pulls it on the server over SSH and
-recreates the container. Both are plain shell with variables you can override (`NUC`, `DIR`, `SERVICE`); edit the
+recreates the container. Both are plain shell with variables you can override (`HOST`, `DIR`, `SERVICE`); edit the
 defaults for your own host and registry.

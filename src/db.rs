@@ -246,6 +246,8 @@ pub struct Settings {
     pub hook_token: String,
     /// files read or written at once; the work is network/disk bound, so more threads mostly add load
     pub io_threads: usize,
+    /// jobs running at once (1..8); MusicBrainz stays at 1 req/s across all of them
+    pub max_jobs: usize,
 }
 
 impl Default for Settings {
@@ -291,14 +293,21 @@ impl Default for Settings {
             navidrome_password: String::new(),
             hook_token: String::new(),
             io_threads: 3,
+            max_jobs: 1,
         }
     }
 }
 
 impl Settings {
-    /// Thread pool for file I/O (scan reads, writes), sized by `io_threads`.
+    /// Thread pool for file I/O (scan reads, writes), sized by `io_threads`. Its workers count
+    /// progress and cancels against the job that built it.
     pub fn io_pool(&self) -> rayon::ThreadPool {
-        rayon::ThreadPoolBuilder::new().num_threads(self.io_threads.clamp(1, 16)).build().unwrap()
+        let job = crate::job::current();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(self.io_threads.clamp(1, 16))
+            .start_handler(move |_| crate::job::enter(job.clone()))
+            .build()
+            .unwrap()
     }
 
     pub fn load(c: &Connection) -> Settings {
