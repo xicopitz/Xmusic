@@ -14,7 +14,7 @@ Self-hosted music metadata fixer: a Rust binary that serves a web dashboard (dai
 - `auth.rs`: argon2 users, sha256-hashed session tokens, per-IP login throttle.
 - `tags.rs`: tag read/write. FLAC uses native Vorbis comments so custom keys work; other formats use lofty's generic tag.
 - `scan.rs`: incremental walk (mtime+size), parallel tag reads with rayon. `album_dir` folds disc subfolders (`CD1/`, `Disc 2/`) into their parent album.
-- `remote.rs`: all HTTP calls (MusicBrainz, AcoustID, CAA, LRCLIB, Gotify, Navidrome `startScan`).
+- `remote.rs`: all HTTP calls (MusicBrainz, Discogs, AcoustID, CAA, LRCLIB, Gotify, Navidrome `startScan`).
 - `matcher.rs`: candidate scoring, track alignment, building proposals, custom tags and rewrite rules.
 - `apply.rs`: every file write (`write_with_undo`). The album pass (`albums`) fetches covers and lyrics per album, then writes each track once. `Pass` picks which parts run (full run: all; the Jobs page can run covers or lyrics alone). Also undo and trash.
 - `job.rs`: the single background job, phases, progress/ETA, cron scheduler, notifications (linking to `public_url`), and the Navidrome rescan after any job that changed files.
@@ -29,11 +29,13 @@ Self-hosted music metadata fixer: a Rust binary that serves a web dashboard (dai
 - A run writes each file at most once: `apply::albums` gathers approved tags, the cover and lyrics, then makes one `write_with_undo` per track. Don't add a pass that writes files on its own. On rclone and SMB mounts every write re-uploads the whole file, and lofty rewrites the whole FLAC anyway.
 - `write_with_undo` skips files whose values already match, and updates the row via `scan::store` without re-reading the file. Every extra open costs on a network mount.
 - File I/O (scan reads, writes) runs in `Settings::io_pool()`, sized by `io_threads`. Don't use rayon's global pool for file work.
-- MusicBrainz is limited to 1 req/s by the global slot in `remote.rs`. Don't bypass it or parallelize MB calls.
+- MusicBrainz is limited to 1 req/s by the global slot in `remote.rs`. Don't bypass it or parallelize MB calls. Discogs has its own slot (25/min without a token, 60 with).
+- Discogs is a second source: `matcher::match_album` asks it only when nothing scores above `match_threshold`. Its release ids are `discogs:<n>` (`matcher::DISCOGS`); a Discogs match writes `DISCOGS_RELEASE_ID` and never `MUSICBRAINZ_*`. "Has a release id" means either one: use `db::HAS_RELEASE` in SQL.
 - Jobs never wait for a human. Low-confidence albums become `review`/`manual` proposals and are reported when the run ends.
 - Settings, libraries and users are admin-only (`web.rs` has an `admin_only` guard arm; user routes go above it).
+- Backup and restore (`web::files`) stream whole files and skip the JSON-only body check, so they check the admin session themselves. Restore goes through `db::restore` (SQLite backup API into the live database, after keeping `xmusic-before-restore.db`); never swap the database file under a running server.
 - An album is the set of tracks in one directory (`tracks.dir`), where a disc subfolder counts as its parent's directory. Compute it only with `scan::album_dir`.
-- Full runs only match albums where no track has a release id (`job::NEEDS_MATCH`); an unaligned bonus track must not re-queue an applied album. A re-match (`job::Kind::Rematch`) also scores the album's own release (`matcher::match_album` picks up `MUSICBRAINZ_ALBUMID`), always lands in Review, never auto-applies, and is marked applied when nothing differs.
+- Full runs only match albums where no track has a release id (`job::NEEDS_MATCH`); an unaligned bonus track must not re-queue an applied album. A re-match (`job::Kind::Rematch`) also scores the album's own release (`matcher::match_album` picks up `MUSICBRAINZ_ALBUMID` or `DISCOGS_RELEASE_ID`), always lands in Review, never auto-applies, and is marked applied when nothing differs.
 - A cover.jpg/folder.jpg in the album folder (`scan::COVER_FILES`, recorded per album in `cover_files` by each scan) counts as a cover: such albums aren't embedded or reported as missing one. Use `db::HAS_COVER` in SQL.
 - Cover upgrades only replace a cover with a bigger one, and shrinking (`cover_shrink_above`) only with a smaller one. Both log the old picture bytes (`undo_log.old_cover`) so undo restores it.
 - Secret settings (`Settings::SECRETS`) never reach the browser: `GET /api/settings` sends `Settings::masked()`, and `PUT` restores masked values with `unmask`. A new secret goes in that list.

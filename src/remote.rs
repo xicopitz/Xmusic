@@ -1,4 +1,4 @@
-//! HTTP clients: MusicBrainz, AcoustID, Cover Art Archive, LRCLIB. Responses stay serde_json::Value.
+//! HTTP clients: MusicBrainz, Discogs, AcoustID, Cover Art Archive, LRCLIB. Responses stay serde_json::Value.
 
 use serde_json::Value;
 use std::sync::{LazyLock, Mutex};
@@ -9,6 +9,8 @@ static AGENT: LazyLock<Mutex<(String, ureq::Agent)>> = LazyLock::new(|| Mutex::n
 static MB_SLOT: Mutex<Option<Instant>> = Mutex::new(None);
 // LRCLIB is a small free service that answers 503 when parallel albums hammer it
 static LRCLIB_SLOT: Mutex<Option<Instant>> = Mutex::new(None);
+// Discogs allows 25 req/min without a token and 60 with one
+static DISCOGS_SLOT: Mutex<Option<Instant>> = Mutex::new(None);
 static LRCLIB_PAUSED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Waits until `gap` has passed since the slot's last request, then claims it.
@@ -90,6 +92,35 @@ pub fn search_releases(contact: &str, artist: &str, album: &str, tracks: usize) 
 
 pub fn release(contact: &str, mbid: &str) -> Res<Value> {
     mb_get(contact, &format!("release/{mbid}"), &[("inc", "recordings artist-credits release-groups genres labels")])
+}
+
+fn discogs_get(contact: &str, token: &str, path: &str, query: &[(&str, &str)]) -> Res<Value> {
+    let token = token.trim();
+    pace(&DISCOGS_SLOT, Duration::from_millis(if token.is_empty() { 2500 } else { 1100 }));
+    let mut req = http(contact).get(format!("https://api.discogs.com/{path}"));
+    if !token.is_empty() {
+        req = req.header("Authorization", format!("Discogs token={token}"));
+    }
+    for (k, v) in query {
+        req = req.query(*k, *v);
+    }
+    counted("discogs", req.call()).map_err(|e| format!("discogs: {e}"))?.body_mut().read_json().map_err(|e| format!("discogs: {e}"))
+}
+
+/// Discogs release ids for an artist + album, singles left out when the album has more tracks.
+pub fn discogs_search(contact: &str, token: &str, artist: &str, album: &str, tracks: usize) -> Res<Vec<String>> {
+    let v = discogs_get(contact, token, "database/search", &[("type", "release"), ("artist", artist), ("release_title", album), ("per_page", "10")])?;
+    Ok(v["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| tracks <= 3 || !r["format"].as_array().into_iter().flatten().any(|f| f == "Single"))
+        .filter_map(|r| r["id"].as_u64().map(|id| id.to_string()))
+        .collect())
+}
+
+pub fn discogs_release(contact: &str, token: &str, id: &str) -> Res<Value> {
+    discogs_get(contact, token, &format!("releases/{id}"), &[])
 }
 
 /// Runs chromaprint's fpcalc → (duration secs, fingerprint). None if fpcalc is missing or fails.

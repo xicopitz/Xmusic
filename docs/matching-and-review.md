@@ -8,10 +8,11 @@ xmusic works per album, and an album is the set of tracks in one folder. Disc su
 
 ## How an album is matched
 
-1. **Which albums.** A full run only matches albums that have no MusicBrainz release id. Albums that already have
+1. **Which albums.** A full run only matches albums that have no MusicBrainz or Discogs release id. Albums that already have
    a pending proposal, or that you ignored, are skipped.
 2. **Candidates.** MusicBrainz is searched with the album's artist and title tags. If the tags are too poor and
    an AcoustID key is set, xmusic fingerprints up to three tracks with `fpcalc` and looks the recordings up.
+   If still nothing reaches the match threshold, Discogs is searched too (see below).
 3. **Scoring.** Each candidate gets a confidence from 0 to 1 based on how well artist, album title, track count
    and track titles/lengths line up. Releases from your preferred countries and media (`XW`, `US`; Digital
    Media, CD by default) win ties.
@@ -21,6 +22,21 @@ xmusic works per album, and an album is the set of tracks in one folder. Disc su
 
 The search stops at the first candidate that scores above the auto-apply threshold with every track aligned,
 which saves MusicBrainz calls. MusicBrainz is queried at most once per second, as their rules require.
+
+## Discogs
+
+Discogs lists many pressings, small labels and bootlegs that MusicBrainz doesn't have. When MusicBrainz (and
+AcoustID) find nothing above the **match threshold**, xmusic searches Discogs with the same artist and album and
+scores up to three releases the same way. Discogs candidates carry a *Discogs* badge in the proposal.
+
+- Turn it off with **Settings → General → Search Discogs**. It works without an account; a personal access token
+  (discogs.com → Settings → Developers) raises the limit from 25 to 60 lookups a minute.
+- A Discogs match writes the usual tags plus `DISCOGS_RELEASE_ID`, never `MUSICBRAINZ_*` ids. `ORIGINALDATE` is
+  left out (Discogs keeps it on the master release), and the genre is Discogs' broad one, such as *Rock*.
+- Covers come from the Cover Art Archive, which needs a MusicBrainz id, so Discogs-matched albums get no
+  cover from xmusic. A `cover.jpg` in the folder still counts.
+- You can paste a Discogs release link (`https://www.discogs.com/release/14335422-…`) in the proposal's manual
+  pick box, just like a MusicBrainz one.
 
 ## What happens next
 
@@ -58,7 +74,7 @@ applied.
 ## Which tags are written
 
 Only the fields in **Write fields** (default `TITLE, ARTIST, ALBUM, ALBUMARTIST, DATE, ORIGINALDATE, TRACKNUMBER,
-TRACKTOTAL, DISCNUMBER, DISCTOTAL, GENRE, LABEL, CATALOGNUMBER, MUSICBRAINZ_*`) are changed, and fields in **Preserve fields** (`COMMENT`,
+TRACKTOTAL, DISCNUMBER, DISCTOTAL, GENRE, LABEL, CATALOGNUMBER, MUSICBRAINZ_*, DISCOGS_*`) are changed, and fields in **Preserve fields** (`COMMENT`,
 `REPLAYGAIN_*`) are never overwritten. Patterns end in `*`.
 
 - `GENRE` is the release's most voted MusicBrainz genre, or its release group's when the release has none.

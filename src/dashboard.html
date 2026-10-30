@@ -85,6 +85,9 @@ const bytes = b => { b = +b || 0; const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i
 const dur = s => { s = Math.round(+s || 0); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s` };
 const when = ts => ts ? new Date(ts * 1000).toLocaleString() : '—';
 const pct = (a, b) => b ? Math.round(100 * a / b) : 0;
+// release ids are MusicBrainz MBIDs or `discogs:<n>`
+const releaseUrl = id => id.startsWith('discogs:') ? `https://www.discogs.com/release/${encodeURIComponent(id.slice(8))}` : `https://musicbrainz.org/release/${encodeURIComponent(id)}`;
+const sourceBadge = id => id.startsWith('discogs:') ? '<span class="badge badge-xs badge-secondary">Discogs</span>' : '';
 const shortDir = d => esc(String(d).split('/').slice(-2).join(' / '));
 let ME = null;
 
@@ -400,7 +403,7 @@ const pages = {
     const rowsTable = (k, cols) => `<div class="hidden sm:grid grid-cols-[1fr_1fr_1fr_auto] gap-2 text-xs font-semibold opacity-70 mb-1">${cols.map(c => `<span>${c[1]}</span>`).join('')}<span class="w-12"></span></div>
       <div class="flex flex-col gap-2" data-rows="${k}">${s[k].map(r => ruleRow(cols, r)).join('')}</div>
       <button class="btn btn-sm mt-2" data-add="${k}" data-cols='${JSON.stringify(cols)}'>+ Add</button>`;
-    const tabs = { general: 'General', libraries: 'Libraries', metadata: 'Metadata', media: 'Cover & lyrics', notify: 'Integrations' };
+    const tabs = { general: 'General', libraries: 'Libraries', metadata: 'Metadata', media: 'Cover & lyrics', notify: 'Integrations', backup: 'Backup' };
     el.innerHTML = `
       <div role="tablist" class="tabs tabs-box mb-4 w-fit flex-wrap">${Object.entries(tabs).map(([k, l]) => `<a role="tab" class="tab ${k === tab ? 'tab-active' : ''}" data-stab="${k}">${l}</a>`).join('')}</div>
       <div class="card bg-base-100 shadow-sm"><div class="card-body gap-4">
@@ -412,6 +415,9 @@ const pages = {
         ${txt('auto_apply_above', 'Auto-apply above', 'At or above this confidence changes are written without review. 0 = always review.', 'number', 'step="0.01" min="0" max="1"')}
         <div class="flex flex-col gap-2">${txt('acoustid_key', 'AcoustID API key', 'An <b>application</b> key (acoustid.org → Register an application), not the user key on your profile. Enables fingerprint matching for badly tagged files.', 'password', 'autocomplete="off"')}
           <div class="flex flex-wrap items-center gap-2"><button class="btn btn-sm" id="acoustid-test">Test key</button><span id="acoustid-status" class="text-sm"></span></div></div>
+        <div class="flex flex-col gap-2"><span class="text-sm font-medium">Discogs</span>
+          ${chk('discogs_enabled', 'Search Discogs when MusicBrainz has no good match')}
+          ${txt('discogs_token', 'Discogs token (optional)', 'A personal access token (discogs.com → Settings → Developers) raises Discogs’ limit from 25 to 60 lookups a minute. Matching works without one.', 'password', 'autocomplete="off"')}</div>
         <div class="flex flex-col gap-2"><span class="text-sm font-medium">Watch mode</span>
           ${chk('watch_enabled', 'Scan automatically when files in a library change')}
           ${chk('watch_full_run', 'After changes, do a full run (match + apply) instead of a scan only')}
@@ -463,9 +469,18 @@ const pages = {
         ${txt('navidrome_password', 'Password', '', 'password')}
         <div><button class="btn" id="navidrome-test">Start a Navidrome scan</button><p class="text-xs opacity-70 mt-1">Uses the saved settings, so save first.</p></div>
       </div>
+      <div data-pane="backup" class="grid gap-6 md:grid-cols-2">
+        <div class="flex flex-col gap-2"><h3 class="font-semibold">Back up</h3>
+          <p class="text-sm opacity-70 grow-0">One file with everything xmusic keeps: settings, users, libraries, proposals and the undo log (the original tags of every file it changed). Your music is not in it.</p>
+          <a class="btn w-fit" href="/api/backup" download>⬇️ Download backup</a></div>
+        <div class="flex flex-col gap-2"><h3 class="font-semibold">Restore</h3>
+          <p class="text-sm opacity-70 grow-0">Replaces everything above with a backup, including users and passwords, so you may have to log in again. The current database is kept as <code>xmusic-before-restore.db</code> in the data folder. A scan follows. Not while a job runs.</p>
+          <input type="file" class="file-input w-full" id="restore-file" accept=".db,application/vnd.sqlite3">
+          <button class="btn btn-error btn-outline w-fit" id="restore" disabled>Restore this backup</button></div>
+      </div>
       <div class="card-actions justify-end" id="save-row"><button class="btn btn-primary" id="save">Save settings</button></div>
       </div></div>`;
-    const showPane = k => { $$('[data-pane]', el).forEach(p => p.classList.toggle('hidden', p.dataset.pane !== k)); $('#save-row').classList.toggle('hidden', k === 'libraries') };
+    const showPane = k => { $$('[data-pane]', el).forEach(p => p.classList.toggle('hidden', p.dataset.pane !== k)); $('#save-row').classList.toggle('hidden', k === 'libraries' || k === 'backup') };
     showPane(tab);
     $$('[data-stab]', el).forEach(a => a.onclick = () => { sessionStorage.setItem('settingsTab', a.dataset.stab); $$('[data-stab]', el).forEach(x => x.classList.toggle('tab-active', x === a)); showPane(a.dataset.stab) });
     el.onclick = e => {
@@ -482,6 +497,19 @@ const pages = {
       toast('Settings saved');
     });
     $('#notify-test', el).onclick = guard(async () => { await post('/api/notify/test'); toast('Test notification sent') });
+    $('#restore-file', el).onchange = e => $('#restore', el).disabled = !e.target.files.length;
+    $('#restore', el).onclick = guard(async () => {
+      const file = $('#restore-file', el).files[0], btn = $('#restore', el);
+      if (!file || !confirm(`Replace all xmusic data with “${file.name}”? Settings, users, review and undo history all come from the backup.`)) return;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="loading loading-spinner loading-xs"></span> Restoring…';
+      try {
+        const r = await fetch('/api/restore', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+        toast('Restored; reloading');
+        setTimeout(() => location.reload(), 1000);
+      } catch (e) { btn.disabled = false; btn.textContent = 'Restore this backup'; throw e }
+    });
     $('#acoustid-test', el).onclick = guard(async () => {
       const out = $('#acoustid-status', el);
       out.innerHTML = '<span class="loading loading-spinner loading-xs"></span>';
@@ -532,16 +560,16 @@ async function openProposal(id) {
     <div class="flex flex-wrap gap-2 items-center my-3">
       <span class="badge badge-lg">${esc(p.status)}</span>
       <span class="badge badge-lg ${p.confidence >= .9 ? 'badge-success' : p.confidence >= .7 ? 'badge-warning' : 'badge-error'}">${Math.round((p.confidence || 0) * 100)}% confidence</span>
-      ${p.release_id ? `<a class="link" target="_blank" rel="noopener" href="https://musicbrainz.org/release/${esc(p.release_id)}">${esc(p.release_title)} ↗</a>` : '<span class="opacity-60">no release selected</span>'}
+      ${p.release_id ? `${sourceBadge(p.release_id)}<a class="link" target="_blank" rel="noopener" href="${esc(releaseUrl(p.release_id))}">${esc(p.release_title)} ↗</a>` : '<span class="opacity-60">no release selected</span>'}
     </div>
     ${p.note ? `<div class="alert alert-warning text-sm mb-3">${esc(p.note)}</div>` : ''}
     <div class="collapse collapse-arrow bg-base-200 mb-3 ${p.status === 'manual' ? 'collapse-open' : ''}"><input type="checkbox"><div class="collapse-title font-semibold">Candidates & manual pick</div><div class="collapse-content">
       <table class="table table-sm"><thead><tr><th>Release</th><th class="hidden sm:table-cell">Date</th><th class="hidden sm:table-cell">Country</th><th class="hidden sm:table-cell">Tracks</th><th>Score</th><th></th></tr></thead><tbody>
-      ${p.candidates.map(c => `<tr><td>${esc(c.artist)} – ${esc(c.title)}<div class="text-xs opacity-70 sm:hidden">${esc(c.date)} · ${esc(c.country)} · ${c.tracks} tracks</div></td>
+      ${p.candidates.map(c => `<tr><td><a class="link link-hover" target="_blank" rel="noopener" href="${esc(releaseUrl(c.id))}">${esc(c.artist)} – ${esc(c.title)}</a> ${sourceBadge(c.id)}<div class="text-xs opacity-70 sm:hidden">${esc(c.date)} · ${esc(c.country)} · ${c.tracks} tracks</div></td>
         <td class="hidden sm:table-cell">${esc(c.date)}</td><td class="hidden sm:table-cell">${esc(c.country)}</td><td class="hidden sm:table-cell">${c.tracks}</td><td>${Math.round(c.score * 100)}%</td>
         <td><button class="btn btn-xs" data-pick="${esc(c.id)}" ${c.id === p.release_id ? 'disabled' : ''}>Use</button></td></tr>`).join('') || '<tr><td colspan="6" class="opacity-60">No candidates.</td></tr>'}
       </tbody></table>
-      <div class="join w-full mt-2"><input id="mbid" class="input join-item grow" placeholder="Paste a MusicBrainz release link or MBID"><button class="btn join-item" id="mbid-use">Use release</button></div>
+      <div class="join w-full mt-2"><input id="mbid" class="input join-item grow" placeholder="Paste a MusicBrainz or Discogs release link"><button class="btn join-item" id="mbid-use">Use release</button></div>
     </div></div>
     <h4 class="font-semibold mb-1">Changes (${changed.length} of ${p.tracks.length} files)</h4>
     <div class="overflow-y-auto max-h-[50vh] flex flex-col gap-3">
@@ -554,7 +582,7 @@ async function openProposal(id) {
     </div>`).join('') || '<p class="opacity-60 text-sm">No tag changes (cover art and lyrics may still be added).</p>'}
     </div>
     <div class="modal-action flex-wrap">
-      <button class="btn btn-ghost" data-rematch title="Look this album up on MusicBrainz again">🔄 Re-match</button>
+      <button class="btn btn-ghost" data-rematch title="Look this album up on MusicBrainz (and Discogs) again">🔄 Re-match</button>
       ${p.status === 'applied' ? '<button class="btn btn-error btn-outline" data-act="undo">Undo this album</button>' : ''}
       ${p.status !== 'rejected' && p.status !== 'applied' ? '<button class="btn btn-ghost" data-act="reject" title="Never match this album again">Ignore</button>' : ''}
       ${p.status !== 'applied' && p.release_id ? '<button class="btn btn-primary" data-act="approve">Approve & apply</button>' : ''}
@@ -626,7 +654,7 @@ async function renderLib(append = false) {
       <div class="p-3 flex flex-col gap-1 min-w-0">
         <span class="font-semibold text-sm truncate" title="${esc(a.album || a.dir)}">${esc(a.album || shortDir(a.dir))}</span>
         <span class="text-xs opacity-70 truncate">${esc(a.artist || 'Unknown artist')}${a.year ? ' · ' + esc(a.year) : ''}</span>
-        <span class="flex flex-wrap gap-1 items-center">${fmtBadges(a.formats)}<span class="text-xs opacity-60">${a.tracks} tr</span>${a.tagged ? '' : '<span class="badge badge-xs badge-warning" title="No MusicBrainz ID">untagged</span>'}</span>
+        <span class="flex flex-wrap gap-1 items-center">${fmtBadges(a.formats)}<span class="text-xs opacity-60">${a.tracks} tr</span>${a.tagged ? '' : '<span class="badge badge-xs badge-warning" title="No MusicBrainz or Discogs ID">untagged</span>'}</span>
       </div></button>`).join('');
   if (!append) body.innerHTML = `<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-3" id="lib-grid"></div><div id="lib-more" class="flex justify-center mt-4"></div>`;
   if (!list.length && !append) $('#lib-grid').innerHTML = '<p class="opacity-60 col-span-full">No albums found.</p>';
@@ -676,7 +704,7 @@ async function openAlbum(dir) {
   const g = k => t0.map(t => t.tags[k]).find(Boolean);
   const total = t0.reduce((x, t) => x + t.size, 0), secs = t0.reduce((x, t) => x + t.duration, 0);
   const coverId = (t0.find(t => t.has_cover) || t0[0])?.id;
-  const mbid = g('MUSICBRAINZ_ALBUMID');
+  const mbid = g('MUSICBRAINZ_ALBUMID'), discogs = g('DISCOGS_RELEASE_ID');
   const quality = t => t.bit_depth ? `${t.bit_depth}-bit / ${t.sample_rate / 1000} kHz` : `${t.bitrate} kbps`;
   const body = $('#modal-body');
   body.innerHTML = `
@@ -690,9 +718,11 @@ async function openAlbum(dir) {
           ${t0.some(t => t.has_cover) ? `<span class="badge badge-xs">cover ${Math.max(...t0.map(t => t.cover_px)) || '?'}px</span>` : a.cover_file ? '<span class="badge badge-xs" title="cover.jpg next to the files, not embedded">cover file</span>' : '<span class="badge badge-xs badge-warning">no cover</span>'}
           ${(n => `<span class="badge badge-xs ${n === t0.length ? '' : 'badge-warning'}">lyrics ${n}/${t0.length}</span>`)(t0.filter(t => t.has_lyrics).length)}</div>
         <div class="flex flex-wrap gap-2 mt-1 text-sm">
-          ${mbid ? `<a class="link" target="_blank" rel="noopener" href="https://musicbrainz.org/release/${esc(mbid)}">MusicBrainz ↗</a>` : '<span class="badge badge-warning badge-sm">no MusicBrainz ID</span>'}
+          ${mbid ? `<a class="link" target="_blank" rel="noopener" href="${esc(releaseUrl(mbid))}">MusicBrainz ↗</a>` : ''}
+          ${discogs ? `<a class="link" target="_blank" rel="noopener" href="${esc(releaseUrl('discogs:' + discogs))}">Discogs ↗</a>` : ''}
+          ${mbid || discogs ? '' : '<span class="badge badge-warning badge-sm">no release ID</span>'}
           ${a.proposal ? `<a class="link" data-proposal="${a.proposal.id}">Proposal (${esc(a.proposal.status)})</a>` : ''}
-          <button class="btn btn-xs" data-rematch title="Look this album up on MusicBrainz again and propose fixes for wrong titles and tags">🔄 Re-match</button></div>
+          <button class="btn btn-xs" data-rematch title="Look this album up again and propose fixes for wrong titles and tags">🔄 Re-match</button></div>
         <p class="text-xs font-mono opacity-50 break-all">${esc(dir)}</p>
       </div>
     </div>

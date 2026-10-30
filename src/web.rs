@@ -9,7 +9,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::io::{Cursor, Read};
 use std::sync::Arc;
-use tiny_http::{Header, Method, Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, ResponseBox, Server};
 
 type Resp = Response<Cursor<Vec<u8>>>;
 
@@ -28,8 +28,8 @@ pub fn serve() {
             let server = server.clone();
             std::thread::spawn(move || {
                 while let Ok(mut req) = server.recv() {
-                    let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(&mut req)))
-                        .unwrap_or_else(|_| err(500, "internal error"));
+                    let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| files(&mut req).unwrap_or_else(|| handle(&mut req).boxed())))
+                        .unwrap_or_else(|_| err(500, "internal error").boxed());
                     let _ = req.respond(resp);
                 }
             })
@@ -89,6 +89,81 @@ pub fn rows(c: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<Value> {
     .unwrap()
     .map(Result::unwrap)
     .collect()
+}
+
+/// A pasted release: an MBID or musicbrainz.org/release/<mbid> link, a discogs.com/…/release/<n>-slug link,
+/// or an id as stored (`discogs:<n>`). Discogs ids come back as `discogs:<n>`.
+fn release_id(input: &str) -> Option<String> {
+    let input = input.trim();
+    let discogs = input.strip_prefix(matcher::DISCOGS).or_else(|| input.contains("discogs.com").then(|| input.split("/release/").nth(1)).flatten());
+    if let Some(rest) = discogs {
+        let n: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        return (!n.is_empty()).then(|| format!("{}{n}", matcher::DISCOGS));
+    }
+    let mbid = input.split(['?', '#']).next()?.trim_end_matches('/').rsplit('/').next()?;
+    (mbid.len() == 36).then(|| mbid.to_string())
+}
+
+#[test]
+fn parses_pasted_release() {
+    let mb = "1c3b758d-6620-42e9-bfaf-15b63e0b0128";
+    assert_eq!(release_id(mb).as_deref(), Some(mb));
+    assert_eq!(release_id(&format!("https://musicbrainz.org/release/{mb}/")).as_deref(), Some(mb));
+    assert_eq!(release_id("https://www.discogs.com/release/2094476-The-White-Stripes-3").as_deref(), Some("discogs:2094476"));
+    assert_eq!(release_id("https://www.discogs.com/pt_BR/release/2094476").as_deref(), Some("discogs:2094476"));
+    assert_eq!(release_id("discogs:42").as_deref(), Some("discogs:42"));
+    assert_eq!(release_id("https://www.discogs.com/master/123-x"), None);
+    assert_eq!(release_id("hello"), None);
+}
+
+/// Database backup (download) and restore (upload). Whole files, possibly large, so they're streamed and
+/// skip the JSON handling. Admin only. None for every other route.
+fn files(req: &mut Request) -> Option<ResponseBox> {
+    let path = req.url().split('?').next().unwrap_or_default();
+    let backup = *req.method() == Method::Get && path == "/api/backup";
+    if !backup && !(*req.method() == Method::Post && path == "/api/restore") {
+        return None;
+    }
+    let fail = |code, msg: &str| Some(err(code, msg).boxed());
+    let c = db::open();
+    if !auth::session_user(&c, &cookie(req).unwrap_or_default()).is_some_and(|u| u.admin) {
+        return fail(403, "admin only");
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let tmp = db::data_dir().join(format!("{}-{nanos}.tmp", if backup { "backup" } else { "restore" }));
+    if backup {
+        if let Err(e) = db::backup(&c, &tmp) {
+            return fail(500, &e);
+        }
+        let file = std::fs::File::open(&tmp);
+        std::fs::remove_file(&tmp).ok(); // the open handle keeps the data until the download ends
+        let name = format!("xmusic-{}.db", chrono::Local::now().format("%Y-%m-%d"));
+        return Some(
+            Response::from_file(file.ok()?)
+                .with_header(header("Content-Type", "application/vnd.sqlite3"))
+                .with_header(header("Content-Disposition", &format!("attachment; filename=\"{name}\"")))
+                .boxed(),
+        );
+    }
+    // like JSON, a cross-site form can't send this type without a CORS preflight
+    if !req.headers().iter().any(|h| h.field.equiv("Content-Type") && h.value.as_str() == "application/octet-stream") {
+        return fail(415, "application/octet-stream required");
+    }
+    if job::running() {
+        return fail(409, "a job is running; restore when it has finished");
+    }
+    let res = std::fs::File::create(&tmp)
+        .and_then(|mut f| std::io::copy(req.as_reader(), &mut f))
+        .map_err(|e| format!("upload: {e}"))
+        .and_then(|_| db::restore(&tmp));
+    std::fs::remove_file(&tmp).ok();
+    if let Err(e) = res {
+        return fail(400, &e);
+    }
+    job::reschedule();
+    crate::watch::reload();
+    job::start(job::Kind::Scan); // the library may have changed since the backup
+    Some(ok(json!({"ok": true})).boxed())
 }
 
 fn handle(req: &mut Request) -> Resp {
@@ -448,12 +523,13 @@ fn library(c: &Connection, body: &Value) -> Value {
             params![q, artist, offset]
         ));
     }
+    let has_release = db::HAS_RELEASE;
     json!(rows(
         c,
         &format!("SELECT dir, MAX(json_extract(tags,'$.ALBUM')) AS album, MAX({ARTIST}) AS artist,
                     MAX(substr(json_extract(tags,'$.DATE'),1,4)) AS year, GROUP_CONCAT(DISTINCT format) AS formats,
                     COUNT(*) AS tracks, SUM(size) AS bytes, SUM(duration) AS seconds,
-                    MIN(json_extract(tags,'$.MUSICBRAINZ_ALBUMID') IS NOT NULL) AS tagged,
+                    MIN({has_release}) AS tagged,
                     COALESCE(MIN(CASE WHEN has_cover=1 THEN id END), MIN(id)) AS cover_id
                   FROM tracks WHERE dir IN ({matching}) GROUP BY dir
                   ORDER BY lower(COALESCE(artist,'')), year, lower(COALESCE(album, dir)) LIMIT 61 OFFSET ?3"),
@@ -661,18 +737,15 @@ fn proposal_action(c: &Connection, id: &str, action: &str, body: &Value) -> Resp
             ok(json!({"ok": true}))
         }
         "pick" => {
-            let mbid = body["release_id"].as_str().unwrap_or_default().trim();
-            // accept a bare id or a pasted musicbrainz.org/release/<id> URL
-            let mbid = mbid.trim_end_matches('/').rsplit('/').next().unwrap_or_default().to_string();
-            if mbid.len() != 36 {
-                return err(400, "release id must be a MusicBrainz release MBID");
-            }
+            let Some(release) = release_id(body["release_id"].as_str().unwrap_or_default()) else {
+                return err(400, "paste a MusicBrainz or Discogs release link, or an MBID");
+            };
             let dir: String = match c.query_row("SELECT dir FROM proposals WHERE id=?1", [id], |r| r.get(0)) {
                 Ok(d) => d,
                 Err(_) => return err(404, "not found"),
             };
             let tracks = db::tracks_where(c, "dir=?1", [&dir]);
-            match matcher::for_release(&tracks, &mbid, &Settings::load(c)) {
+            match matcher::for_release(&tracks, &release, &Settings::load(c)) {
                 Ok((conf, rel, ch)) => {
                     c.execute(
                         "UPDATE proposals SET status='review', confidence=?1, release_id=?2, release_title=?3, changes=?4, updated=?5 WHERE id=?6",

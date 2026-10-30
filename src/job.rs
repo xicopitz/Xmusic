@@ -316,7 +316,9 @@ fn rematch_one(c: &rusqlite::Connection, dir: &str, s: &Settings) -> String {
 
 // an album with an id on any track is matched: a bonus track the release doesn't list never gets one,
 // and re-matching the album for it on every run would put an applied album back in Review
-const NEEDS_MATCH: &str = "FROM tracks WHERE dir NOT IN (SELECT dir FROM tracks WHERE json_extract(tags,'$.MUSICBRAINZ_ALBUMID') IS NOT NULL)
+// (a const can't use format!, so this spells out db::HAS_RELEASE)
+const NEEDS_MATCH: &str = "FROM tracks WHERE dir NOT IN (SELECT dir FROM tracks WHERE json_extract(tags,'$.MUSICBRAINZ_ALBUMID') IS NOT NULL
+      OR json_extract(tags,'$.DISCOGS_RELEASE_ID') IS NOT NULL)
     AND dir NOT IN (SELECT dir FROM proposals WHERE status IN ('review','manual','rejected','approved'))";
 
 fn run(kind: Kind, s: &Settings) -> String {
@@ -375,7 +377,7 @@ fn run(kind: Kind, s: &Settings) -> String {
                     count(&c, "SELECT COALESCE(SUM(size),0) FROM tracks"),
                     applied as i64,
                     review_total,
-                    count(&c, "SELECT COUNT(DISTINCT dir) FROM tracks WHERE dir NOT IN (SELECT dir FROM tracks WHERE json_extract(tags,'$.MUSICBRAINZ_ALBUMID') IS NOT NULL)"),
+                    count(&c, &format!("SELECT COUNT(DISTINCT dir) FROM tracks WHERE dir NOT IN (SELECT dir FROM tracks WHERE {})", db::HAS_RELEASE)),
                 ],
             )
             .unwrap();

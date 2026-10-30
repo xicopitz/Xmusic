@@ -117,6 +117,98 @@ pub fn parse_release(v: &Value) -> Release {
     }
 }
 
+/// Release ids from Discogs carry this prefix; bare ids are MusicBrainz MBIDs.
+pub const DISCOGS: &str = "discogs:";
+
+/// "Tuff (2)" is how Discogs tells same-named artists (and labels) apart; the number isn't part of the name.
+fn discogs_name(name: &str) -> &str {
+    match name.rsplit_once(" (") {
+        Some((n, num)) if num.strip_suffix(')').is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit())) => n,
+        _ => name,
+    }
+}
+
+/// Discogs credits joined like MusicBrainz's; `anv` is the name as printed on the release.
+fn discogs_artists(v: &Value) -> String {
+    let mut out = String::new();
+    for a in v.as_array().into_iter().flatten() {
+        let name = a["anv"].as_str().filter(|n| !n.is_empty()).or(a["name"].as_str()).unwrap_or_default();
+        out += discogs_name(name).trim_end_matches('*');
+        match a["join"].as_str().unwrap_or_default().trim() {
+            "" => {}
+            "," => out += ", ",
+            j => out += &format!(" {j} "),
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Disc number from a Discogs position: "2-05", "CD2-5" and "2.5" are disc 2; "7" and vinyl "A1" are disc 1.
+fn discogs_disc(pos: &str) -> usize {
+    pos.split_once(['-', '.']).and_then(|(d, _)| d.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().ok()).unwrap_or(1)
+}
+
+/// "4:32" or "1:02:03" → seconds; 0 when missing.
+fn duration(s: &str) -> f64 {
+    s.split(':').try_fold(0.0, |acc, p| p.trim().parse::<f64>().ok().map(|n| acc * 60.0 + n)).unwrap_or(0.0)
+}
+
+/// A Discogs release as a `Release`. Tracks are numbered in order per disc (vinyl sides become 1, 2, 3…).
+pub fn parse_discogs(v: &Value) -> Release {
+    let s = |x: &Value| x.as_str().unwrap_or_default().to_string();
+    let artist = discogs_artists(&v["artists"]);
+    let list: Vec<&Value> = v["tracklist"].as_array().into_iter().flatten().filter(|t| t["type_"] != "heading").collect();
+    let discs: Vec<usize> = list.iter().map(|t| discogs_disc(t["position"].as_str().unwrap_or_default())).collect();
+    let disc_total = discs.iter().collect::<std::collections::BTreeSet<_>>().len();
+    let mut seen: HashMap<usize, usize> = HashMap::new();
+    let tracks = list
+        .iter()
+        .zip(&discs)
+        .map(|(t, &disc)| {
+            let pos = seen.entry(disc).or_default();
+            *pos += 1;
+            let ta = discogs_artists(&t["artists"]);
+            RelTrack {
+                disc,
+                pos: *pos,
+                disc_total,
+                track_total: discs.iter().filter(|d| **d == disc).count(),
+                title: s(&t["title"]),
+                length: duration(t["duration"].as_str().unwrap_or_default()),
+                recording: String::new(),
+                id: String::new(),
+                artist: if ta.is_empty() { artist.clone() } else { ta },
+                artist_id: String::new(),
+            }
+        })
+        .collect();
+    let label = &v["labels"][0];
+    let date = v["released"].as_str().unwrap_or_default().trim_end_matches("-00").trim_end_matches("-00").to_string();
+    Release {
+        id: format!("{DISCOGS}{}", v["id"]),
+        title: s(&v["title"]),
+        artist,
+        artist_id: String::new(),
+        date: if date.is_empty() && v["year"].as_u64().unwrap_or(0) > 0 { v["year"].to_string() } else { date },
+        country: s(&v["country"]),
+        formats: v["formats"].as_array().into_iter().flatten().map(|f| s(&f["name"])).collect(),
+        rg_id: String::new(),
+        genre: v["genres"][0].as_str().map(String::from),
+        label: discogs_name(label["name"].as_str().unwrap_or_default()).to_string(),
+        catalog: Some(s(&label["catno"])).filter(|c| !c.eq_ignore_ascii_case("none")).unwrap_or_default(),
+        original_date: String::new(),
+        tracks,
+    }
+}
+
+/// A release by id: an MBID, or `discogs:<id>`.
+pub fn fetch_release(s: &Settings, id: &str) -> Result<Release, String> {
+    match id.strip_prefix(DISCOGS) {
+        Some(n) => remote::discogs_release(&s.contact_email, &s.discogs_token, n).map(|v| parse_discogs(&v)),
+        None => remote::release(&s.contact_email, id).map(|v| parse_release(&v)),
+    }
+}
+
 fn sim(a: &str, b: &str) -> f64 {
     normalized_levenshtein(&a.trim().to_lowercase(), &b.trim().to_lowercase())
 }
@@ -255,12 +347,17 @@ pub fn changes(local: &[Track], rel: &Release, assign: &[Option<usize>], s: &Set
             put("DISCNUMBER", r.disc.to_string());
             put("DISCTOTAL", r.disc_total.to_string());
             put("GENRE", rel.genre.clone().unwrap_or_default());
-            put("MUSICBRAINZ_TRACKID", r.recording.clone());
-            put("MUSICBRAINZ_RELEASETRACKID", r.id.clone());
-            put("MUSICBRAINZ_ALBUMID", rel.id.clone());
-            put("MUSICBRAINZ_ARTISTID", r.artist_id.clone());
-            put("MUSICBRAINZ_ALBUMARTISTID", rel.artist_id.clone());
-            put("MUSICBRAINZ_RELEASEGROUPID", rel.rg_id.clone());
+            match rel.id.strip_prefix(DISCOGS) {
+                Some(n) => put("DISCOGS_RELEASE_ID", n.to_string()),
+                None => {
+                    put("MUSICBRAINZ_TRACKID", r.recording.clone());
+                    put("MUSICBRAINZ_RELEASETRACKID", r.id.clone());
+                    put("MUSICBRAINZ_ALBUMID", rel.id.clone());
+                    put("MUSICBRAINZ_ARTISTID", r.artist_id.clone());
+                    put("MUSICBRAINZ_ALBUMARTISTID", rel.artist_id.clone());
+                    put("MUSICBRAINZ_RELEASEGROUPID", rel.rg_id.clone());
+                }
+            }
         }
         apply_rules(t, &mut new, s, &rules);
         if !new.is_empty() {
@@ -312,10 +409,12 @@ pub fn match_album(local: &[Track], s: &Settings) -> Proposal {
         }
     }
     // already tagged (a re-match): score the release it claims to be, so wrong titles show up as changes
-    let own = majority(local, "MUSICBRAINZ_ALBUMID");
-    if !own.is_empty() && !rels.iter().any(|r| r.id == own) {
-        match remote::release(ua, own) {
-            Ok(v) => rels.push(parse_release(&v)),
+    let own = Some(majority(local, "MUSICBRAINZ_ALBUMID").to_string())
+        .filter(|o| !o.is_empty())
+        .or_else(|| Some(majority(local, "DISCOGS_RELEASE_ID")).filter(|o| !o.is_empty()).map(|o| format!("{DISCOGS}{o}")));
+    if let Some(own) = own.filter(|o| !rels.iter().any(|r| &r.id == o)) {
+        match fetch_release(s, &own) {
+            Ok(r) => rels.push(r),
             Err(e) => notes.push(e),
         }
     }
@@ -357,6 +456,28 @@ pub fn match_album(local: &[Track], s: &Settings) -> Proposal {
         }
     }
 
+    // second source: Discogs has many pressings and small releases MusicBrainz lacks
+    if s.discogs_enabled && !album.is_empty() && best(&rels, &fp) < s.match_threshold {
+        match remote::discogs_search(ua, &s.discogs_token, artist, album, local.len()) {
+            Ok(ids) => {
+                for id in ids.iter().take(3) {
+                    match remote::discogs_release(ua, &s.discogs_token, id) {
+                        Ok(v) => {
+                            let r = parse_discogs(&v);
+                            let (sc, assign) = score(local, &r, &fp, s);
+                            rels.push(r);
+                            if sc >= s.match_threshold && assign.iter().all(Option::is_some) {
+                                break;
+                            }
+                        }
+                        Err(e) => notes.push(e),
+                    }
+                }
+            }
+            Err(e) => notes.push(e),
+        }
+    }
+
     let mut scored: Vec<(f64, Vec<Option<usize>>, Release)> = rels
         .into_iter()
         .map(|r| {
@@ -386,8 +507,8 @@ pub fn match_album(local: &[Track], s: &Settings) -> Proposal {
 }
 
 /// User picked (or pasted) a release: rebuild the proposal against it.
-pub fn for_release(local: &[Track], mbid: &str, s: &Settings) -> Result<(f64, Release, Changes), String> {
-    let rel = parse_release(&remote::release(&s.contact_email, mbid)?);
+pub fn for_release(local: &[Track], id: &str, s: &Settings) -> Result<(f64, Release, Changes), String> {
+    let rel = fetch_release(s, id)?;
     let (sc, assign) = score(local, &rel, &[], s);
     let ch = changes(local, &rel, &assign, s);
     Ok((sc, rel, ch))
@@ -434,6 +555,35 @@ mod tests {
         assert_eq!(ch[&11]["MUSICBRAINZ_ALBUMID"], "rel1");
         assert_eq!(ch[&11]["LABEL"], "Columbia");
         assert_eq!(ch[&11]["ORIGINALDATE"], "1959");
+    }
+
+    #[test]
+    fn parses_discogs() {
+        let v = serde_json::json!({
+            "id": 42, "title": "Live", "released": "1993-02-00", "year": 1993, "country": "US", "genres": ["Rock"],
+            "artists": [{ "name": "Tuff (2)", "anv": "", "join": "&" }, { "name": "Guest", "anv": "The Guest", "join": "" }],
+            "labels": [{ "name": "Atlantic (3)", "catno": "none" }], "formats": [{ "name": "CD" }],
+            "tracklist": [
+                { "type_": "heading", "position": "", "title": "Disc one" },
+                { "type_": "track", "position": "1-1", "title": "A", "duration": "4:32" },
+                { "type_": "track", "position": "1-2", "title": "B", "duration": "" },
+                { "type_": "track", "position": "CD2-1", "title": "C", "duration": "1:02:03", "artists": [{ "name": "Solo", "join": "" }] },
+            ],
+        });
+        let r = parse_discogs(&v);
+        assert_eq!(r.id, "discogs:42");
+        assert_eq!(r.artist, "Tuff & The Guest");
+        assert_eq!((r.date.as_str(), r.label.as_str(), r.catalog.as_str()), ("1993-02", "Atlantic", ""));
+        let t: Vec<_> = r.tracks.iter().map(|t| (t.disc, t.pos, t.track_total, t.disc_total, t.length, t.artist.as_str())).collect();
+        assert_eq!(t, vec![(1, 1, 2, 2, 272.0, "Tuff & The Guest"), (1, 2, 2, 2, 0.0, "Tuff & The Guest"), (2, 1, 1, 2, 3723.0, "Solo")]);
+        // vinyl sides number straight through
+        let v = serde_json::json!({ "id": 1, "tracklist": [{ "type_": "track", "position": "A1" }, { "type_": "track", "position": "B1" }] });
+        assert_eq!(parse_discogs(&v).tracks.iter().map(|t| (t.disc, t.pos)).collect::<Vec<_>>(), vec![(1, 1), (1, 2)]);
+
+        let local = vec![track(1, "A", 1, 272.0)];
+        let ch = changes(&local, &r, &[Some(0)], &Settings::default());
+        assert_eq!(ch[&1]["DISCOGS_RELEASE_ID"], "42");
+        assert!(!ch[&1].keys().any(|k| k.starts_with("MUSICBRAINZ_")), "no MusicBrainz ids from a Discogs release");
     }
 
     #[test]

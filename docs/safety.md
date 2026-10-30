@@ -17,6 +17,9 @@ so it can be restored. Files that already match are not written at all.
 
 Undo from an album's proposal (**Undo this album**) or for everything (**Jobs → Undo all changes**).
 
+The undo log lives in the database, so keep a backup of it (**Settings → Backup**): without it, the original
+tags of changed files can't be restored.
+
 ## Duplicates and the trash
 
 **Keep this copy** moves the other copies to `.xmusic-trash/` in the same library. They keep their relative

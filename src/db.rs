@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn data_dir() -> PathBuf {
     std::env::var("XMUSIC_DATA").unwrap_or_else(|_| "./data".into()).into()
@@ -52,9 +52,13 @@ pub fn init(c: &Connection) {
 }
 
 /// Schema changes after the first release, keyed on PRAGMA user_version.
+const LATEST: i64 = 5;
+
+fn version(c: &Connection) -> i64 {
+    c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+}
+
 fn migrate(c: &Connection) {
-    let version = |c: &Connection| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap();
-    const LATEST: i64 = 4;
     if version(c) >= LATEST {
         return;
     }
@@ -84,19 +88,63 @@ fn migrate(c: &Connection) {
         )
         .expect("migration 3");
     }
-    if version(c) < 4 {
-        // label, catalog number and original date are new defaults; add them to a saved write list
+    // new default write fields join a saved write list too
+    let add_fields = |keys: &[&str]| {
         let mut s = Settings::load(c);
-        for k in ["LABEL", "CATALOGNUMBER", "ORIGINALDATE"] {
+        for k in keys {
             if !s.write_fields.iter().any(|f| f.eq_ignore_ascii_case(k)) {
-                s.write_fields.push(k.into());
+                s.write_fields.push(k.to_string());
             }
         }
         s.save(c);
+    };
+    if version(c) < 4 {
+        add_fields(&["LABEL", "CATALOGNUMBER", "ORIGINALDATE"]);
         c.execute_batch("PRAGMA user_version=4;").expect("migration 4");
+    }
+    if version(c) < 5 {
+        add_fields(&["DISCOGS_*"]); // albums matched on Discogs get DISCOGS_RELEASE_ID
+        c.execute_batch("PRAGMA user_version=5;").expect("migration 5");
     }
     c.execute_batch("COMMIT").unwrap();
 }
+
+/// A consistent copy of the live database at `to` (which must not exist), taken while others keep using it.
+pub fn backup(c: &Connection, to: &Path) -> Result<(), String> {
+    c.execute("VACUUM INTO ?1", [to.to_string_lossy()]).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Replace the live database with the one at `from`, in place: other connections see the new data. Checks
+/// that it is an xmusic database with an admin, keeps a copy of the current one in
+/// `xmusic-before-restore.db`, then migrates it if it's from an older version.
+pub fn restore(from: &Path) -> Result<(), String> {
+    let src = Connection::open_with_flags(from, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())?;
+    let check: String = src.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(|_| "not an SQLite database".to_string())?;
+    if check != "ok" {
+        return Err(format!("the file is damaged: {check}"));
+    }
+    let admins: i64 = src
+        .query_row("SELECT COUNT(*) FROM users WHERE role='admin'", [], |r| r.get(0))
+        .map_err(|_| "not an xmusic database".to_string())?;
+    if admins == 0 || src.prepare("SELECT 1 FROM tracks, settings, libraries").is_err() {
+        return Err("not an xmusic database with an admin user".into());
+    }
+    if version(&src) > LATEST {
+        return Err("this backup is from a newer xmusic; update first".into());
+    }
+    let mut c = open();
+    let keep = data_dir().join("xmusic-before-restore.db");
+    std::fs::remove_file(&keep).ok();
+    backup(&c, &keep)?;
+    rusqlite::backup::Backup::new(&src, &mut c)
+        .and_then(|b| b.run_to_completion(i32::MAX, std::time::Duration::ZERO, None))
+        .map_err(|e| format!("restore: {e}"))?;
+    init(&c);
+    Ok(())
+}
+
+/// SQL condition on `tracks`: the track is matched, to a MusicBrainz or a Discogs release.
+pub const HAS_RELEASE: &str = "(json_extract(tags,'$.MUSICBRAINZ_ALBUMID') IS NOT NULL OR json_extract(tags,'$.DISCOGS_RELEASE_ID') IS NOT NULL)";
 
 /// SQL condition on `tracks`: embedded art, or a cover.jpg / folder.jpg in the album folder (`cover_files`, refreshed by each scan).
 pub const HAS_COVER: &str = "(has_cover=1 OR dir IN (SELECT dir FROM cover_files))";
@@ -148,6 +196,10 @@ pub struct Settings {
     pub match_threshold: f64,
     pub auto_apply_above: f64,
     pub acoustid_key: String,
+    /// second source when MusicBrainz has no good match
+    pub discogs_enabled: bool,
+    /// optional personal access token: raises Discogs' limit from 25 to 60 requests a minute
+    pub discogs_token: String,
     pub contact_email: String,
     pub write_fields: Vec<String>,
     pub preserve_fields: Vec<String>,
@@ -194,9 +246,11 @@ impl Default for Settings {
             match_threshold: 0.80,
             auto_apply_above: 0.95,
             acoustid_key: String::new(),
+            discogs_enabled: true,
+            discogs_token: String::new(),
             contact_email: String::new(),
             write_fields: ["TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "DATE", "ORIGINALDATE", "TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL", "GENRE",
-                "LABEL", "CATALOGNUMBER", "MUSICBRAINZ_*"]
+                "LABEL", "CATALOGNUMBER", "MUSICBRAINZ_*", "DISCOGS_*"]
                 .map(String::from)
                 .to_vec(),
             preserve_fields: vec!["COMMENT".into(), "REPLAYGAIN_*".into()],
@@ -254,7 +308,7 @@ impl Settings {
 
     /// Secret fields are never sent to the browser: it gets `MASK` when one is set, and sends `MASK`
     /// back to keep the stored value.
-    pub const SECRETS: [&str; 3] = ["acoustid_key", "gotify_token", "navidrome_password"];
+    pub const SECRETS: [&str; 4] = ["acoustid_key", "discogs_token", "gotify_token", "navidrome_password"];
     pub const MASK: &str = "••••••••";
 
     pub fn masked(&self) -> serde_json::Value {

@@ -1,8 +1,8 @@
 # xmusic
 
 Self-hosted music metadata fixer. xmusic scans your library, matches albums against
-[MusicBrainz](https://musicbrainz.org) (and [AcoustID](https://acoustid.org) fingerprints for badly tagged
-files), and writes correct tags, cover art ([Cover Art Archive](https://coverartarchive.org)) and lyrics
+[MusicBrainz](https://musicbrainz.org) (with [AcoustID](https://acoustid.org) fingerprints for badly tagged
+files, and [Discogs](https://www.discogs.com) for releases MusicBrainz lacks), and writes correct tags, cover art ([Cover Art Archive](https://coverartarchive.org)) and lyrics
 ([LRCLIB](https://lrclib.net)) back into your files. It is one Rust binary with a web dashboard, built for
 people who keep their music on a NAS or a home server.
 
